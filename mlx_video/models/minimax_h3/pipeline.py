@@ -1,23 +1,254 @@
-"""H3 pipeline glue: tokenize → embed → PackedLayout → sample → decode.
+"""H3 pipeline glue: geometry helpers + full-model container + end-to-end
+sample loop.
 
-Port target: comfy_extras/nodes_minimax_h3.py (whole file, 337 LOC), specifically:
-  - EmptyMiniMaxH3LatentAV.execute
-  - MiniMaxH3ImageToVideo.execute (t2va / fl2va)
-  - MiniMaxH3ReferenceToVideo.execute (ref2va)
-  - MiniMaxH3SigmaShift.execute
+Port of the shape and encoding logic in ``comfy_extras/nodes_minimax_h3.py``.
+We omit the multi-modal reference presentation for the Phase-7 smoke test —
+the dummy text encoder replaces it — and keep only the plumbing needed to run
+a t2va / fl2va / ref2va sample.
 
-Video/audio latent shape helpers:
-  - align_frame_count(n): snap up to 17k+5
-  - video_latent_t(n):    2 if n<=5 else ((n-5)//17)*5+2
-  - temporal_shape(len):  (frame_count, video_latent_t, round(duration*40))
-  - adapt_canvas(w, h):   768 short edge, 768*1344 area cap, 32-round
+Public API
+----------
+    ``adapt_canvas(w, h) -> (canvas_w, canvas_h)``
+    ``temporal_shape(length) -> (frame_count, video_latent_t, audio_latent_t)``
 
-Reference sizing:
-  - image "match":  min(1, sqrt((W*H)/(w*h))) — no upscale
-  - image "max":    min(1, REF_IMAGE_SHORT_EDGE / min(w,h)) — 2048 short edge
+    ``H3Pipeline(dit, video_vae, audio_vae, text_encoder, scheduler)``
+        .generate(prompt, width, height, length, ref_image=None,
+                  ref_audio_wav=None, num_steps=15, seed=0) -> (video_np, audio_np)
 """
 
-# TODO: reference from /tmp/h3_recon/ComfyUI/comfy_extras/nodes_minimax_h3.py:1-337
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import mlx.core as mx
+import numpy as np
+
+from .model import MiniMaxH3Model
+from .packed_layout import PackedLayout, RefBlock
+from .scheduler import MiniMaxH3Scheduler
 
 
-raise NotImplementedError("Phase 7: implement H3 pipeline glue")
+# ---------------------------------------------------------------------------
+# Geometry helpers (mirror the reference)
+# ---------------------------------------------------------------------------
+
+CANVAS_MULTIPLE = 32
+BASE_SHORT_EDGE = 768
+MAX_PIXELS = 768 * 1344
+FPS = 24
+AUDIO_LATENT_FPS = 40
+
+
+def align_frame_count(n: int) -> int:
+    """Snap ``n`` up to the next value ``n % 17 == 5`` (H3's frame grid)."""
+    while n % 17 != 5:
+        n += 1
+    return n
+
+
+def video_latent_t(frame_count: int) -> int:
+    """Latent-time size for a given frame count (post align_frame_count)."""
+    return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
+
+
+def temporal_shape(length: int) -> Tuple[int, int, int]:
+    """Return (aligned_frame_count, video_latent_t, audio_latent_t)."""
+    frame_count = align_frame_count(max(5, length))
+    duration = frame_count / FPS
+    return frame_count, video_latent_t(frame_count), round(duration * AUDIO_LATENT_FPS)
+
+
+def adapt_canvas(width: int, height: int) -> Tuple[int, int]:
+    """768-short-edge canvas with 768*1344 area cap, per-axis round to 32."""
+    ratio = width / height
+    if ratio >= 1.0:
+        nom_w, nom_h = BASE_SHORT_EDGE * ratio, BASE_SHORT_EDGE
+    else:
+        nom_w, nom_h = BASE_SHORT_EDGE, BASE_SHORT_EDGE / ratio
+    if nom_w * nom_h > MAX_PIXELS:
+        s = math.sqrt(MAX_PIXELS / (nom_w * nom_h))
+        nom_w, nom_h = nom_w * s, nom_h * s
+    return (
+        max(CANVAS_MULTIPLE, round(nom_w / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+        max(CANVAS_MULTIPLE, round(nom_h / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class H3Pipeline:
+    dit: Any  # MiniMaxH3Model
+    video_vae: Any  # MiniMaxH3VideoVAE
+    audio_vae: Any  # MiniMaxH3AudioVAE
+    text_encoder: Any  # anything with .encode(prompt) -> [1, L, 5120] mx.array
+    scheduler: MiniMaxH3Scheduler = field(default_factory=MiniMaxH3Scheduler)
+
+    def _empty_av_latents(self, width: int, height: int, frame_count: int, dtype: mx.Dtype = mx.float32):
+        _, latent_t, audio_t = temporal_shape(frame_count)
+        video = mx.zeros((1, 24, latent_t, height // 16, width // 16), dtype=dtype)
+        audio = mx.zeros((1, 32, 2, audio_t), dtype=dtype)
+        return video, audio, latent_t, audio_t
+
+    def generate(
+        self,
+        prompt: str = "",
+        width: int = 384,
+        height: int = 384,
+        length: int = 5,
+        num_steps: int = 15,
+        seed: int = 0,
+        ref_image_latent: Optional[mx.array] = None,
+        ref_audio_latent: Optional[mx.array] = None,
+        verbose: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """End-to-end t2va (with optional ref image / ref audio).
+
+        Returns
+        -------
+        video_np : uint8 [T_frames, H, W, 3]
+        audio_np : float32 [T_samples] (mono) — pipe both channels concatenated
+        info     : {'wall_time_s', 'peak_rss_gb', 'num_steps', ...}
+        """
+        import time as _time
+        import resource as _resource
+
+        t0 = _time.time()
+        frame_count, latent_t, audio_t = temporal_shape(length)
+        if verbose:
+            print(f"[H3] frame_count={frame_count}, latent_t={latent_t}, audio_t={audio_t}")
+
+        # ------- 1) Initial noise (video + audio) -------
+        rng = np.random.default_rng(seed)
+        video_latent = mx.array(rng.standard_normal((1, 24, latent_t, height // 16, width // 16)).astype(np.float32))
+        audio_latent = mx.array(rng.standard_normal((1, 32, 2, audio_t)).astype(np.float32))
+
+        # ------- 2) Text embeddings (fp32) -------
+        context = self.text_encoder.encode(prompt).astype(mx.float32)
+        text_len = context.shape[1]
+
+        # ------- 3) Set up scheduler + noise scale -------
+        self.scheduler.set_timesteps(num_steps)
+        video_latent = self.scheduler.scale_noise(video_latent)
+        audio_latent = self.scheduler.scale_noise(audio_latent)
+
+        # ------- 4) Build ref blocks (optional, ref2va path) -------
+        refs: List[RefBlock] = []
+        payload: Dict[str, Any] = {"seed": seed}
+        cond_video_latents = []
+        cond_audio_latents = []
+        if ref_image_latent is not None:
+            # ref_image_latent shape: [1, 24, 1, h, w]
+            _, _, _, rh, rw = ref_image_latent.shape
+            refs.append(RefBlock(kind="image", latent_h=rh, latent_w=rw))
+            cond_video_latents.append(ref_image_latent)
+        if ref_audio_latent is not None:
+            # ref_audio_latent shape: [1, 32, 2, T]
+            rat = ref_audio_latent.shape[-1]
+            refs.append(RefBlock(kind="audio", ref_audio_t=rat))
+            cond_audio_latents.append(ref_audio_latent)
+        if refs:
+            payload["refs"] = refs
+            payload["cond_video_latents"] = cond_video_latents
+            payload["cond_audio_latents"] = cond_audio_latents
+
+        # Cache layout across steps
+        layout = PackedLayout(
+            text_len, latent_t, height // 16, width // 16, audio_t,
+            refs=refs if refs else None,
+        )
+        payload["layout"] = layout
+        if verbose:
+            print(f"[H3] packed seq_len={layout.seq_len}")
+
+        # ------- 5) Denoise loop -------
+        for i in range(num_steps):
+            step_t0 = _time.time()
+            ts = self.scheduler.timestep_for(i)
+            v_video, v_audio = self.dit(
+                (video_latent, audio_latent), ts, context, payload=payload,
+            )
+            mx.eval(v_video, v_audio)
+            video_latent, audio_latent = self.scheduler.step(
+                v_video, v_audio, i, video_latent, audio_latent,
+            )
+            mx.eval(video_latent, audio_latent)
+            if verbose:
+                sigma = float(self.scheduler.sigmas[i])
+                print(f"[H3] step {i+1}/{num_steps}: sigma={sigma:.4f}, "
+                      f"step={_time.time()-step_t0:.1f}s")
+
+        # ------- 6) Decode video + audio via VAEs -------
+        if verbose:
+            print("[H3] decoding video...")
+        video_pixels = self.video_vae.decode(video_latent)  # [1, C=3, T, H, W]
+        mx.eval(video_pixels)
+        if verbose:
+            print("[H3] decoding audio...")
+        audio_waveform = self.audio_vae.decode(audio_latent)  # [1, C=2, T]
+        mx.eval(audio_waveform)
+
+        # ------- 7) Convert to numpy -------
+        video_np = np.asarray(video_pixels).astype(np.float32)
+        video_np = np.clip((video_np + 1.0) * 0.5, 0.0, 1.0)  # [-1,1] -> [0,1]
+        video_np = (video_np * 255).astype(np.uint8)
+        # video_np: [1, C=3, T, H, W] -> [T, H, W, 3]
+        video_np = video_np[0].transpose(1, 2, 3, 0)
+
+        audio_np = np.asarray(audio_waveform).astype(np.float32)[0]  # [C=2, T]
+
+        peak_rss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        info = {
+            "wall_time_s": _time.time() - t0,
+            "peak_rss_gb": peak_rss_kb / 1024 / 1024,
+            "num_steps": num_steps,
+            "frame_count": frame_count,
+            "video_shape": tuple(video_np.shape),
+            "audio_shape": tuple(audio_np.shape),
+            "seq_len": layout.seq_len,
+        }
+        return video_np, audio_np, info
+
+
+# ---------------------------------------------------------------------------
+# Loader helpers
+# ---------------------------------------------------------------------------
+
+
+def load_pipeline(
+    model_root: Path = Path("~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-bf16"),
+    text_encoder=None,
+) -> H3Pipeline:
+    """Load a fully-assembled H3 pipeline from a converted model directory.
+
+    Falls back to a DummyTextEncoder if none is passed (Phase-7 smoke path).
+    """
+    from .config import MiniMaxH3Config
+    from .video_vae import MiniMaxH3VideoVAE
+    from .audio_vae import MiniMaxH3AudioVAE
+    from .text_encoder_bridge import DummyTextEncoder
+
+    model_root = Path(model_root).expanduser()
+
+    cfg = MiniMaxH3Config()
+    dit = MiniMaxH3Model(cfg)
+    dit.load_weights(str(model_root / "dit" / "model.safetensors"))
+
+    video_vae = MiniMaxH3VideoVAE()
+    video_vae.load_weights(str(model_root / "video_vae" / "model.safetensors"), strict=False)
+
+    audio_vae = MiniMaxH3AudioVAE()
+    audio_vae.load_weights(str(model_root / "audio_vae" / "model.safetensors"), strict=False)
+
+    if text_encoder is None:
+        text_encoder = DummyTextEncoder()
+
+    scheduler = MiniMaxH3Scheduler()
+    return H3Pipeline(dit=dit, video_vae=video_vae, audio_vae=audio_vae,
+                      text_encoder=text_encoder, scheduler=scheduler)

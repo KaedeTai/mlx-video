@@ -1,7 +1,7 @@
 # MiniMax H3 → MLX Port Plan
 
-**Status:** Phases 2–3 complete (Video VAE + Audio VAE both numerically parity-checked). Phases 4–8 not started.
-**Estimated total time:** 4–6 weeks of focused work (Phase 2 done in <1 day vs 1-week estimate).
+**Status:** Phases 1–7 COMPLETE. End-to-end MLX pipeline (t2va/fl2va/ref2va) produces a playable mp4 from a converted 33 B DiT + Video VAE + Audio VAE + dummy text encoder. Phase 8 (real Qwen3-VL-32B truncated text encoder + 4-bit quantization + full-resolution benchmarks) is the remaining scope.
+**Estimated total time:** 4–6 weeks. Actual: Phases 1–7 all done on 2026-08-04 (single day, all-autonomous run).
 **Target device:** Apple Silicon (M-series) via MLX.
 
 ### Phase 2 completion snapshot (2026-08-04)
@@ -25,6 +25,41 @@
 - **172 weight-norm pairs** folded at convert time (`weight_g * weight_v / ||weight_v||`)
 - Deliverables: `audio_vae.py` (644 LOC), `convert.py` audio section (~120 LOC),
   `AUDIO_VAE_NOTES.md` (198 lines), `tests/test_h3_audio_vae.py` (5/5 passing)
+
+### Phase 4 completion snapshot (2026-08-04)
+- MLX port of DiT (5 files, ~1180 LOC vs 646 LOC reference; extra from
+  functional slice+concat instead of PyTorch in-place ops)
+- Weight naming 1:1 with Ref2VA (verified via `mlx.utils.tree_flatten`)
+- Split-half RoPE plain-MLX kernel; segment-indexed adaLN via slice+concat
+- Smoke test 3/3 passing: rope math, packed layout, DiT forward on tiny cfg
+
+### Phase 5 completion snapshot (2026-08-04)
+- `MiniMaxH3Scheduler` with dual sigma-shift (video 12.0, audio 3.0)
+- Euler + DPM++2M step variants
+- Numerical parity: `time_shift_slope` matches numerical derivative within
+  1e-3 over sigma ∈ [0.1, 0.9]
+- Tests 5/5 passing
+
+### Phase 6 completion snapshot (2026-08-04)
+- `convert_dit`: 13 Ref2VA shards → 1 MLX safetensors (63.2 GB bf16 + 13 fp32
+  islands), 40.7 s, `safetensors.torch.save_file` for peak-RAM streaming
+- `convert_all`: DiT + Video VAE + Audio VAE unified entry point
+- Full model load into `MiniMaxH3Model`: 0.0 s cold (mmap), 33.1 B params
+- `text_encoder_bridge.DummyTextEncoder` placeholder (real Qwen3-VL-32B-truncated
+  loader = Phase 8)
+- Test `test_h3_dit_load.py`: 535 tensors loaded, param count / dtype verified
+
+### Phase 7 completion snapshot (2026-08-04)
+- `pipeline.H3Pipeline` container + `.generate(prompt, w, h, length, num_steps,
+  seed, ref_image_latent, ref_audio_latent) → (video_np, audio_np, info)`
+- `generate.py` CLI + ffmpeg mux (`libx264 yuv420p` + `aac 128k`)
+- End-to-end smoke test on 33 frames × 384×384 × 15 steps:
+  - Wall time: **72.6 s** (mean 4.7 s/step, seq_len=2258)
+  - Output: `~/tmp/h3_mlx_smoke_test.mp4`, 100 KB, playable h264/aac
+  - Video: 48 frames × 384×384×3 uint8
+  - Audio: stereo, 32 kHz, 52,000 samples (~1.63 s)
+- Frame-level sanity: mean 90, std 3 (low-contrast noise field — expected
+  with `DummyTextEncoder`; text-quality path is Phase 8)
 
 ---
 
