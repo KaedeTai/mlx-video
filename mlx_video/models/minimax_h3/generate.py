@@ -74,13 +74,20 @@ def main():
     p.add_argument("--output", default="~/tmp/h3_mlx_smoke_test.mp4")
     p.add_argument("--ref-image", default=None, help="path to reference image")
     p.add_argument("--ref-audio", default=None, help="path to reference audio (wav)")
+    p.add_argument("--text-encoder-path", default=None,
+                   help="Path to Qwen3-VL MLX checkpoint; falls back to DummyTextEncoder if omitted")
+    p.add_argument("--text-encoder-truncate-layer", type=int, default=50)
     args = p.parse_args()
 
     from .pipeline import load_pipeline
     from .video_vae import IMAGENET_MEAN, IMAGENET_STD
 
     print(f"[generate] loading pipeline from {args.model_root}...")
-    pipe = load_pipeline(Path(args.model_root))
+    pipe = load_pipeline(
+        Path(args.model_root),
+        text_encoder_path=args.text_encoder_path,
+        text_encoder_truncate_layer=args.text_encoder_truncate_layer,
+    )
     print("[generate] pipeline loaded")
 
     ref_image_latent = None

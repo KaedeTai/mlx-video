@@ -4,53 +4,42 @@ MiniMax H3 conditions on the **unnormalized layer-50 hidden state** of
 Qwen3-VL-32B (64 layers total, so layer 50 is a mid-network cut). See
 ``comfy/text_encoders/minimax.py`` in the reference.
 
-There are two viable implementation paths (kept as a design decision):
+Phase 8-1: replaces the Phase-7 ``DummyTextEncoder`` with a real
+``TextEncoderBridge`` that wraps ``mlx-community/Qwen3-VL-32B-Instruct-4bit``
+(loaded via mlx-vlm), truncates the decoder stack at layer 50, and returns
+the raw pre-norm hidden state cast to fp32.
 
-A) **In-repo Qwen3-VL truncated loader.** Convert Ref2VA's own
-   ``text_encoder`` shards (706 language_model keys across 14 shards) to
-   MLX, keep layers 0-49 only, drop the vision blocks (~350 keys) and
-   ``lm_head`` / ``model.language_model.norm``. Output: single safetensors,
-   ~5-7 GB in bf16.
-
-B) **External MLX checkpoint.** Wrap ``mlx-community/Qwen3-VL-32B-Instruct-4bit``
-   in a "stop-at-layer-50" adapter. Reuses the ~15 GB q4 file we already have.
-
-The pipeline (Phase 7) supports **either** by expecting a callable
-``encode_text(prompt: str) -> mx.array`` of shape ``[1, L, 5120]`` (fp32).
-
-For the Phase 7 smoke test we provide a **DummyTextEncoder** that produces
-random or zero-init embeddings of the right shape. The full-quality wiring is
-a Phase 8 optimization (video quality without meaningful text conditioning is
-clearly limited, but the pipeline plumbing works either way).
+The bridge supports **text-only prompts** in this cut. Vision-block
+conditioning through Qwen3-VL (reference images / video segments spliced into
+the token stream per the ComfyUI ref) is out of scope here -- reference images
+still flow through the video VAE + DiT ref-block path. See Phase 9 notes.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 import mlx.core as mx
 import numpy as np
+
+
+TRUNC_LAYERS = 50  # H3 uses Qwen3-VL layers [0, TRUNC_LAYERS)
 
 
 @dataclass
 class DummyTextEncoder:
     """Placeholder text encoder that returns zero-init embeddings.
 
-    Suitable for Phase-7 smoke testing: verifies the pipeline plumbing.
-    Video quality will be uncontrolled since the model gets no semantic signal.
+    Kept for smoke tests / CI where loading the 18 GB Q4 checkpoint is too
+    heavy. Video quality is uncontrolled.
     """
     text_dim: int = 5120
     max_len: int = 128
     seed: int = 0
 
     def encode(self, prompt: str) -> mx.array:
-        """Return ``[1, L, text_dim]`` fp32 embeddings.
-
-        Uses a deterministic length proportional to prompt word count (min 4,
-        max ``self.max_len``); embeddings are small random values so downstream
-        norms don't NaN.
-        """
         L = min(max(4, len(prompt.split()) * 2), self.max_len)
         rng = np.random.default_rng(self.seed)
         emb = rng.standard_normal((1, L, self.text_dim)).astype(np.float32) * 0.01
@@ -58,15 +47,83 @@ class DummyTextEncoder:
 
 
 # ---------------------------------------------------------------------------
-# Q3-VL truncated loader (Phase 8)
+# Real Qwen3-VL-32B truncated encoder (Phase 8-1)
 # ---------------------------------------------------------------------------
-#
-# Sketch (not implemented in Phase 6):
-#
-#   1. mlx_lm.load("mlx-community/Qwen3-VL-32B-Instruct-4bit") -> model, tok
-#   2. Wrap model.forward with an early-exit at layer 50 (patch the
-#      transformer_forward function or reimplement forward through blocks[:50]).
-#   3. Return hidden state pre-norm, cast to fp32.
-#
-# Requires the vision block to be *optional* — we only need text conditioning
-# for the smoke test (no image tokens in the prompt).
+
+
+class TextEncoderBridge:
+    """Wraps mlx-community/Qwen3-VL-32B-Instruct-4bit for H3 conditioning.
+
+    Only text-side layers are used (embed_tokens + first ``truncate_layer``
+    decoder blocks). The vision tower is NOT loaded when
+    ``load_vision=False``, keeping RAM ~18 GB instead of ~19 GB.
+
+    Parameters
+    ----------
+    model_path : str | Path
+        Local MLX checkpoint directory.
+    truncate_layer : int
+        Number of decoder blocks to run (inclusive-exclusive), default 50.
+    load_vision : bool
+        If False (default), skip the vision tower -- vision-block prompt
+        splicing is not exposed at this layer of the port.
+    dtype_fp32_out : bool
+        If True (default), cast the returned hidden state to fp32 to match
+        the DiT ingestion path.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        truncate_layer: int = TRUNC_LAYERS,
+        load_vision: bool = False,
+        dtype_fp32_out: bool = True,
+    ) -> None:
+        self.model_path = str(Path(model_path).expanduser())
+        self.truncate_layer = int(truncate_layer)
+        self.load_vision = load_vision
+        self.dtype_fp32_out = dtype_fp32_out
+
+        from mlx_vlm import load as _mlx_vlm_load
+
+        model, processor = _mlx_vlm_load(self.model_path, lazy=False)
+        self.processor = processor
+        self.tokenizer = getattr(processor, "tokenizer", processor)
+
+        lang = model.language_model
+        lang.model.layers = lang.model.layers[: self.truncate_layer]
+
+        if not self.load_vision and hasattr(model, "vision_tower"):
+            del model.vision_tower
+
+        self._model = model
+        self._lang = lang
+        self.text_dim = lang.args.hidden_size  # 5120
+
+    def _encode_no_vision(self, prompt: str) -> mx.array:
+        input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if len(input_ids) == 0:
+            input_ids = [151643]  # pad token, matches Comfy fallback
+
+        ids = mx.array([input_ids], dtype=mx.int32)  # [1, L]
+        h = self._lang.model.embed_tokens(ids)  # [1, L, 5120]
+
+        B, L, _ = h.shape
+
+        pos = mx.arange(L, dtype=mx.int32)
+        pos = mx.broadcast_to(pos[None, :], (B, L))
+        pos = mx.broadcast_to(pos[None, ...], (3, B, L))
+
+        from mlx_vlm.models.base import create_attention_mask
+        mask = create_attention_mask(h, [None] * len(self._lang.model.layers))
+
+        for layer in self._lang.model.layers:
+            h = layer(h, mask=mask, cache=None, position_ids=pos)
+
+        if self.dtype_fp32_out:
+            h = h.astype(mx.float32)
+        mx.eval(h)
+        return h
+
+    def encode(self, prompt: str) -> mx.array:
+        return self._encode_no_vision(prompt)

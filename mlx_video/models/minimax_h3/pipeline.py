@@ -224,15 +224,20 @@ class H3Pipeline:
 def load_pipeline(
     model_root: Path = Path("~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-bf16"),
     text_encoder=None,
+    text_encoder_path: Optional[str] = None,
+    text_encoder_truncate_layer: int = 50,
 ) -> H3Pipeline:
     """Load a fully-assembled H3 pipeline from a converted model directory.
 
-    Falls back to a DummyTextEncoder if none is passed (Phase-7 smoke path).
+    Text encoder resolution (in order):
+      1. ``text_encoder`` (any object with ``.encode(prompt) -> mx.array``)
+      2. ``text_encoder_path`` -> build ``TextEncoderBridge`` (Phase 8-1)
+      3. Fallback: ``DummyTextEncoder`` (Phase-7 smoke test)
     """
     from .config import MiniMaxH3Config
     from .video_vae import MiniMaxH3VideoVAE
     from .audio_vae import MiniMaxH3AudioVAE
-    from .text_encoder_bridge import DummyTextEncoder
+    from .text_encoder_bridge import DummyTextEncoder, TextEncoderBridge
 
     model_root = Path(model_root).expanduser()
 
@@ -247,7 +252,11 @@ def load_pipeline(
     audio_vae.load_weights(str(model_root / "audio_vae" / "model.safetensors"), strict=False)
 
     if text_encoder is None:
-        text_encoder = DummyTextEncoder()
+        if text_encoder_path is not None:
+            text_encoder = TextEncoderBridge(text_encoder_path,
+                                             truncate_layer=text_encoder_truncate_layer)
+        else:
+            text_encoder = DummyTextEncoder()
 
     scheduler = MiniMaxH3Scheduler()
     return H3Pipeline(dit=dit, video_vae=video_vae, audio_vae=audio_vae,

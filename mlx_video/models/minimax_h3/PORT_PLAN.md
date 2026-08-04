@@ -324,3 +324,37 @@ mlx_video/models/minimax_h3/
   (`tile_size=256`), multi-clip temporal chunking with overlap-blend, and the
   `token_drop` cross-clip alignment. Fast path only.
 <parameter name="timeout_ms">10000
+## 12. Phase 8-1 completion checklist (2026-08-04)
+
+Real Qwen3-VL-32B truncated-at-50 text encoder replaces `DummyTextEncoder`.
+
+- [x] Read ComfyUI `comfy/text_encoders/minimax.py` + `qwen3vl.py` recipe
+  (unnormalized layer-50 hidden state, no chat template, raw token ids)
+- [x] Reuse `mlx-community/Qwen3-VL-32B-Instruct-4bit` (already local, 18 GB)
+  via `mlx_vlm.load`; keep `language_model`, drop `vision_tower`, slice
+  `layers[:50]`, skip `norm` on the way out
+- [x] Implement `TextEncoderBridge(model_path, truncate_layer=50)` in
+  `text_encoder_bridge.py`
+- [x] Wire `pipeline.load_pipeline` to accept `text_encoder_path=` +
+  `text_encoder_truncate_layer=`
+- [x] Wire `generate.py` CLI: `--text-encoder-path` and
+  `--text-encoder-truncate-layer`
+- [x] `tests/test_h3_text_encoder.py`: shape + determinism + prompt-conditional
+  + truncation asserts, all passing
+- [x] Prompt-variance sanity: same prompt cos-sim 1.0000; empty vs full-text
+  cos-sim 0.245; different natural-language prompts distinguish via per-token
+  L2 (mean |Δ| > 0.5)
+- [x] Load time 1.3–2.3 s (mlx-vlm cold), forward 100–500 ms for 1–23 tokens,
+  RSS ~18 GB
+- [x] Phase 8-1 commit
+
+### Deferred to Phase 9
+
+- Vision-block splicing through Qwen3-VL for `<Picture i>: <vision block>`
+  (Ref2VA reference images / video-block prompt conditioning). Reference
+  images currently pass through the video VAE + DiT ref-block path only,
+  which is sufficient for pure-prompt validation but leaves the Qwen-side
+  visual conditioning channel unused.
+- Cross-framework PSNR vs PyTorch bf16 reference for layer-50 hidden state
+  (needs an additional ~64 GB load, does not fit alongside the DiT in this
+  cut).
