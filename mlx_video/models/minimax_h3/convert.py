@@ -299,10 +299,173 @@ def convert_audio_vae(
         output_mb=size_mb,
     )
 
+# ---------------------------------------------------------------------------
+# Phase 6: DiT transformer converter (13 shards → 1 MLX safetensors)
+# ---------------------------------------------------------------------------
+
+
+# fp32 islands in the checkpoint (all others are bf16).  We preserve source
+# dtype for these regardless of --dtype selection, since the reference model
+# uses fp32 for these throughout inference.
+_DIT_FP32_KEY_PREFIXES = (
+    "video_patch_proj.",
+    "audio_patch_proj.",
+    "rope.inv_freq",
+    "time_embedder.",
+    "final_layer.video_out.",
+    "final_layer.audio_out.",
+)
+
+
+def _is_dit_fp32_key(key: str) -> bool:
+    return any(key.startswith(p) for p in _DIT_FP32_KEY_PREFIXES)
+
+
+def convert_dit(
+    src_dir: Path,
+    dst: Path,
+    dtype: str = "bf16",
+    verify_keys: bool = True,
+    progress_every: int = 50,
+) -> dict:
+    """Convert the 13 Ref2VA DiT safetensors shards to a single MLX safetensors file.
+
+    Notes
+    -----
+    - Streams one shard at a time to keep peak RAM bounded to ~1 shard (~2 GB).
+    - Preserves fp32 for the 6 designated fp32-island prefixes regardless of
+      ``--dtype`` (the reference uses fp32 for these at inference).
+    - No layout permutations needed — all weights are Linear (2-D or 1-D).
+    - Uses torch to hold weights and safetensors.torch.save_file to avoid
+      MLX's peak-RAM overhead on 29 GB writes.
+    """
+    import safetensors.torch
+    import torch as _torch
+
+    src_dir = Path(src_dir).expanduser()
+    dst = Path(dst).expanduser()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.time()
+    shards = sorted(src_dir.glob("model-*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(f"no DiT shards in {src_dir}")
+
+    if dtype == "bf16":
+        target_dtype = _torch.bfloat16
+    elif dtype == "fp16":
+        target_dtype = _torch.float16
+    elif dtype == "fp32":
+        target_dtype = _torch.float32
+    else:
+        raise ValueError(f"unsupported dtype: {dtype}")
+
+    out: dict = {}
+    total_params = 0
+    n_fp32_kept = 0
+    n_processed = 0
+    for shard_i, shard in enumerate(shards):
+        sd = safetensors.torch.load_file(str(shard))
+        for k, v in sd.items():
+            v = v.detach().cpu()
+            if _is_dit_fp32_key(k):
+                v = v.to(_torch.float32)
+                n_fp32_kept += 1
+            else:
+                v = v.to(target_dtype)
+            out[k] = v.contiguous().clone()
+            total_params += v.numel()
+            n_processed += 1
+            if progress_every and n_processed % progress_every == 0:
+                print(f"[convert-dit] shard {shard_i+1}/{len(shards)}: "
+                      f"{n_processed} tensors processed, {total_params:,} params", flush=True)
+        del sd
+
+    if verify_keys:
+        try:
+            from mlx.utils import tree_flatten
+            from .config import MiniMaxH3Config
+            from .model import MiniMaxH3Model
+            cfg = MiniMaxH3Config()
+            m = MiniMaxH3Model(cfg)
+            mlx_keys = {k for k, _ in tree_flatten(m.parameters())}
+            del m
+            missing = mlx_keys - set(out)
+            extra = set(out) - mlx_keys
+            if missing or extra:
+                print(f"[convert-dit] WARN key mismatch: {len(extra)} ckpt-only, "
+                      f"{len(missing)} module-only", flush=True)
+                for k in sorted(extra)[:10]:
+                    print(f"  ckpt-only: {k}  shape={tuple(out[k].shape)}", flush=True)
+                for k in sorted(missing)[:10]:
+                    print(f"  module-only: {k}", flush=True)
+            else:
+                print(f"[convert-dit] key parity OK ({len(mlx_keys)} keys)", flush=True)
+        except Exception as e:
+            print(f"[convert-dit] key verify skipped: {e}", flush=True)
+
+    print(f"[convert-dit] writing {dst} ({len(out)} tensors)...", flush=True)
+    safetensors.torch.save_file(out, str(dst))
+    dt = time.time() - t0
+    size_mb = dst.stat().st_size / 1024 / 1024
+
+    return dict(
+        num_tensors=len(out),
+        num_params=total_params,
+        num_fp32_preserved=n_fp32_kept,
+        elapsed=dt,
+        output_mb=size_mb,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Full-pipeline convert-all entry point
+# ---------------------------------------------------------------------------
+
+
+def convert_all(
+    ref2va_root: Path = Path("~/models/MiniMax-H3-raw/Ref2VA"),
+    dst_root: Path = Path("~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-bf16"),
+    dtype: str = "bf16",
+) -> dict:
+    """Convert DiT + Video VAE + Audio VAE to a unified MLX model directory.
+
+    Text encoder is handled separately (see text_encoder_bridge.py — we use
+    the pre-existing ~/models/Qwen3-VL-32B-Instruct-4bit MLX checkpoint and
+    truncate to layer 50 at load time).
+    """
+    ref2va_root = Path(ref2va_root).expanduser()
+    dst_root = Path(dst_root).expanduser()
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    stats = {}
+    # DiT
+    print(f"[convert-all] step 1/3: DiT transformer ({dtype})")
+    stats["dit"] = convert_dit(
+        src_dir=ref2va_root / "transformer",
+        dst=dst_root / "dit" / "model.safetensors",
+        dtype=dtype,
+    )
+    # Video VAE
+    print(f"[convert-all] step 2/3: Video VAE")
+    stats["video_vae"] = convert_video_vae(
+        src=ref2va_root / "video_vae" / "source" / "model.safetensors",
+        dst=dst_root / "video_vae" / "model.safetensors",
+        dtype=dtype,
+    )
+    # Audio VAE
+    print(f"[convert-all] step 3/3: Audio VAE")
+    stats["audio_vae"] = convert_audio_vae(
+        src=ref2va_root / "audio_vae" / "model.safetensors",
+        dst=dst_root / "audio_vae" / "model.safetensors",
+        dtype=dtype,
+    )
+    return stats
+
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--component", choices=("video-vae", "audio-vae"), default="video-vae")
+    p.add_argument("--component", choices=("video-vae", "audio-vae", "dit", "all"), default="video-vae")
     p.add_argument("--src", default=None)
     p.add_argument("--dst", default=None)
     p.add_argument("--dtype", choices=("fp32", "fp16", "bf16"), default="bf16")
@@ -317,7 +480,7 @@ def main():
             f"{stats['num_transposed']} conv3d transposed, "
             f"{stats['output_mb']:.1f} MB in {stats['elapsed']:.1f}s -> {dst}"
         )
-    else:
+    elif args.component == "audio-vae":
         src = args.src or "~/models/MiniMax-H3-raw/Ref2VA/audio_vae/model.safetensors"
         dst = args.dst or "~/mlx-video/mlx-models/MiniMaxH3-AudioVAE-MLX-bf16/model.safetensors"
         stats = convert_audio_vae(Path(src), Path(dst), dtype=args.dtype)
@@ -328,9 +491,23 @@ def main():
             f"convT1d permuted={stats['num_convtranspose1d_permuted']}, "
             f"{stats['output_mb']:.1f} MB in {stats['elapsed']:.1f}s -> {dst}"
         )
-
+    elif args.component == "dit":
+        src = args.src or "~/models/MiniMax-H3-raw/Ref2VA/transformer"
+        dst = args.dst or "~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-bf16/dit/model.safetensors"
+        stats = convert_dit(Path(src), Path(dst), dtype=args.dtype)
+        print(
+            f"[convert-dit] {stats['num_tensors']} tensors ({stats['num_params']:,} params), "
+            f"fp32 preserved={stats['num_fp32_preserved']}, "
+            f"{stats['output_mb']:.1f} MB in {stats['elapsed']:.1f}s -> {dst}"
+        )
+    elif args.component == "all":
+        stats = convert_all(dtype=args.dtype)
+        for name, s in stats.items():
+            print(f"[convert-all] {name}: {s['num_tensors']} tensors, {s['num_params']:,} params, {s['output_mb']:.1f} MB, {s['elapsed']:.1f}s")
 
 if __name__ == "__main__":
     main()
+
+
 
 
