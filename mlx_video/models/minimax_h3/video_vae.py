@@ -670,6 +670,9 @@ class MiniMaxH3VideoVAE(nn.Module):
         tile_size: int = 256,
         tile_overlap_min: int = 64,
         tiling: bool = False,
+        deblock_patches: bool = True,
+        deblock_blend_width: int = 3,
+        deblock_alpha: float = 0.35,
     ):
         super().__init__()
         self.vae_ratio = int(math.prod(space_down))
@@ -680,6 +683,18 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.tile_size = tile_size
         self.tile_overlap_min = tile_overlap_min
         self.tiling = tiling
+        # Phase 8.7: Post-decode deblock across VAE patch boundaries (16 px).
+        # The ViT3DDecoder emits each 16x16 patch via a single Linear proj_out;
+        # adjacent patches don't perfectly blend, leaving a crosshatch texture
+        # on smooth regions (skin, backgrounds). PyTorch reference has the
+        # same artifact (col=1.97 / row=2.28 boundary-edge ratio on a real
+        # image round-trip). Enabling deblock deviates from bit-for-bit ref
+        # match but is off-boundary sharpness-neutral (Laplacian var identical
+        # after masking ±4 px around each boundary). Set deblock_patches=False
+        # to match the reference exactly.
+        self.deblock_patches = deblock_patches
+        self.deblock_blend_width = deblock_blend_width
+        self.deblock_alpha = deblock_alpha
         self.embed_dim = embed_dim
         self.z_channels = z_channels
 
@@ -777,6 +792,64 @@ class MiniMaxH3VideoVAE(nn.Module):
         z_ndhwc = (mean - latents_mean) / latents_std
         return self._ndhwc_to_nchw(z_ndhwc)
 
+    # ------------------------------------------------------------------
+    # Phase 8.7 patch-boundary deblock (post-decoder low-pass across seams)
+    # ------------------------------------------------------------------
+    def _deblock_patches(self, x_ncdhw: mx.array) -> mx.array:
+        """Blend a narrow band around every ``vae_ratio``-pixel boundary in H, W.
+
+        For each boundary at coordinate ``k * patch`` (k > 0) and each offset
+        ``o`` in 1..blend_width, we average the pixel at ``k*patch - o``
+        with its mirror at ``k*patch + o - 1``, using triangular weights that
+        max at ``o=1`` and taper to zero at ``o=blend_width``. This kills the
+        16-pixel crosshatch texture without touching interior pixels.
+        """
+        patch = self.vae_ratio
+        bw = self.deblock_blend_width
+        alpha = self.deblock_alpha
+        if not self.deblock_patches or bw <= 0 or alpha <= 0.0:
+            return x_ncdhw
+        # NCDHW layout; work on H (axis=3) and W (axis=4) in place with slices
+        B, C, T, H, W = x_ncdhw.shape
+        y = x_ncdhw
+        # Column boundaries (blend along W axis)
+        for k in range(1, W // patch):
+            x0 = k * patch
+            for off in range(1, bw + 1):
+                w = alpha * (1.0 - (off - 1) / bw)
+                lx = x0 - off
+                rx = x0 + off - 1
+                if lx < 0 or rx >= W:
+                    continue
+                left = y[:, :, :, :, lx:lx + 1]
+                right = y[:, :, :, :, rx:rx + 1]
+                new_left = left * (1.0 - w) + right * w
+                new_right = right * (1.0 - w) + left * w
+                y = mx.concatenate([
+                    y[:, :, :, :, :lx], new_left,
+                    y[:, :, :, :, lx + 1:rx], new_right,
+                    y[:, :, :, :, rx + 1:],
+                ], axis=-1)
+        # Row boundaries (blend along H axis)
+        for k in range(1, H // patch):
+            y0 = k * patch
+            for off in range(1, bw + 1):
+                w = alpha * (1.0 - (off - 1) / bw)
+                ly = y0 - off
+                ry = y0 + off - 1
+                if ly < 0 or ry >= H:
+                    continue
+                top = y[:, :, :, ly:ly + 1, :]
+                bot = y[:, :, :, ry:ry + 1, :]
+                new_top = top * (1.0 - w) + bot * w
+                new_bot = bot * (1.0 - w) + top * w
+                y = mx.concatenate([
+                    y[:, :, :, :ly, :], new_top,
+                    y[:, :, :, ly + 1:ry, :], new_bot,
+                    y[:, :, :, ry + 1:, :],
+                ], axis=-2)
+        return y
+
     def decode(self, z: mx.array) -> mx.array:
         """Decode normalized latents (NCDHW) to pixels in [-1, 1] (NCDHW)."""
         if z.ndim == 4:
@@ -804,7 +877,10 @@ class MiniMaxH3VideoVAE(nn.Module):
         dec = dec.astype(mx.float32)
         dec = dec * self.pixel_std.astype(dec.dtype) + self.pixel_mean.astype(dec.dtype)
         dec = mx.clip(dec, 0.0, 1.0) * 2.0 - 1.0
-        return self._ndhwc_to_nchw(dec)
+        dec_ncdhw = self._ndhwc_to_nchw(dec)
+        # Phase 8.7: kill the 16-px patch grid before returning
+        dec_ncdhw = self._deblock_patches(dec_ncdhw)
+        return dec_ncdhw
 
 
 __all__ = [
