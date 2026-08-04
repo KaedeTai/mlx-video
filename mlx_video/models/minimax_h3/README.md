@@ -7,21 +7,38 @@ VAE at 40 latent fps, Qwen3-VL-32B (layer-50 truncation) conditioning.
 
 ## Port status
 
-**Phase 1 of 8 complete** — architecture recon + scaffold + config only.
-Nothing runs yet. See [`PORT_PLAN.md`](./PORT_PLAN.md) for the full plan.
+**Phases 1–2 of 8 complete.** Video VAE encodes and decodes with numerical
+parity to the PyTorch reference (>60 dB). See [`PORT_PLAN.md`](./PORT_PLAN.md)
+for the full plan and [`VIDEO_VAE_NOTES.md`](./VIDEO_VAE_NOTES.md) for
+architecture notes.
 
 | Phase | Scope | Effort | Status |
 |---|---|---|---|
 | 1 | Architecture recon + scaffold + config | 1–2 h | ✅ Done |
-| 2 | Video VAE (3D causal CNN + ViT3D) | ~1 week | ⏳ Not started |
+| 2 | Video VAE (3D causal CNN + ViT3D) | ~1 week est. → **1 day actual** | ✅ Done |
 | 3 | Audio VAE (DAC + BigVGAN, 32 kHz stereo) | 3–5 days | ⏳ Not started |
 | 4 | DiT transformer (packed-token, 3-axis RoPE) | 2–3 weeks | ⏳ Not started |
 | 5 | Flow-matching scheduler (dual sigma shift) | 2–3 days | ⏳ Not started |
-| 6 | Ref2VA safetensors → MLX conversion | 3–5 days | ⏳ Not started |
+| 6 | Ref2VA safetensors → MLX conversion | 3–5 days | 🚧 Video VAE portion done |
 | 7 | Pipeline glue + smoke test | 3–5 days | ⏳ Not started |
 | 8 | 4-bit quantization + benchmark | 3–5 days | ⏳ Not started |
 
-Estimated total: **4–6 weeks** of focused work.
+Estimated total: **4–6 weeks** of focused work; running ahead of schedule.
+
+### Phase 2 evidence
+
+- Encoder parity (64×64×1f): **139.25 dB PSNR** vs PyTorch reference
+- Decoder parity (4×4×1t):   **62.99 dB PSNR** vs PyTorch reference
+- Full round-trip on face:   **63.05 dB** MLX-vs-PT (both models produce the
+  same ~15 dB reconstruction — the VAE is designed for 17-frame clips, not
+  images)
+- 5 frames × 384×384 encode + decode: **1.88 s + 0.25 s** (bf16, cold)
+- Peak resident set: **5.32 GB** (weights 5.0 + activations ~0.3)
+
+Run the tests:
+```
+python -m pytest tests/test_h3_video_vae.py -v -s
+```
 
 ## Reference implementations
 
@@ -65,13 +82,14 @@ python -m mlx_video.models.minimax_h3.generate \
 
 - `config.py` — `MiniMaxH3Config` dataclass (implemented) + `.from_hf_config()`
 - `PORT_PLAN.md` — full port plan with weight mapping and per-phase risks
-- `attention.py`, `blocks.py`, `model.py`, `packed_layout.py`, `rope.py` — DiT (Phase 4)
-- `video_vae.py` — Phase 2 stub
+- `VIDEO_VAE_NOTES.md` — architecture doc for the Video VAE (Phase 2)
+- `video_vae.py` — **implemented** (Phase 2): 609 LOC, encode/decode
+- `convert.py` — Video VAE converter implemented (Phase 2); more phases to add
+- `attention.py`, `blocks.py`, `model.py`, `packed_layout.py`, `rope.py` — DiT (Phase 4, stubs)
 - `audio_vae.py` — Phase 3 stub
 - `scheduler.py` — Phase 5 stub
 - `text_encoder_bridge.py` — Phase 6 stub
-- `convert.py` — Phase 6 stub
 - `pipeline.py`, `generate.py` — Phase 7 stubs
 
-Every stub raises `NotImplementedError("Phase N: ...")` and carries a `TODO` line
-pointing at the exact ComfyUI file + line range to reference when it's built.
+Remaining stubs raise `NotImplementedError("Phase N: ...")` and carry a `TODO`
+line pointing at the exact ComfyUI file + line range to reference when built.

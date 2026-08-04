@@ -1,8 +1,18 @@
 # MiniMax H3 → MLX Port Plan
 
-**Status:** Phase 1 complete (architecture recon + scaffold). Phases 2–8 not started.
-**Estimated total time:** 4–6 weeks of focused work.
+**Status:** Phase 2 complete (Video VAE numerically parity-checked). Phases 3–8 not started.
+**Estimated total time:** 4–6 weeks of focused work (Phase 2 done in <1 day vs 1-week estimate).
 **Target device:** Apple Silicon (M-series) via MLX.
+
+### Phase 2 completion snapshot (2026-08-04)
+- Encoder parity vs PyTorch reference: **139.25 dB** on 64×64×1-frame input
+- Decoder parity vs PyTorch reference: **62.99 dB** on 4×4×1-token latent
+- Image round-trip vs PyTorch reference: **63.05 dB** (MLX-vs-PT agreement)
+- 5f × 384×384 encode + decode: **1.88 s + 0.25 s** (bf16, cold)
+- 17f × 384×384 encode + decode: **1.77 s + 0.23 s**
+- Peak RSS during forward: **5.32 GB** (weights 5.0 GB + activations ~0.3 GB)
+- Deliverables: `video_vae.py` (609 LOC), `convert.py` VAE section (154 LOC),
+  `VIDEO_VAE_NOTES.md`, `tests/test_h3_video_vae.py` (194 LOC, 4/4 passing)
 
 ---
 
@@ -225,5 +235,45 @@ mlx_video/models/minimax_h3/
 - [x] Write `PORT_PLAN.md` (this doc)
 - [x] Write `README.md`
 - [x] Git branch `minimax-h3-port`, Phase 1 commit
-- [ ] Phase 2 kickoff
+- [x] Phase 2 kickoff
+
+## 11. Phase 2 completion checklist (2026-08-04, one day vs 1-week estimate)
+
+- [x] Read reference impls: ComfyUI vae.py (694 LOC) + Ref2VA/video_vae/*.py (12 files)
+- [x] Write `VIDEO_VAE_NOTES.md` (architecture + shape flow + weight naming table)
+- [x] Implement MLX `video_vae.py` (CausalConv3d, ResnetBlock3D, EncoderFCN3D,
+      RotaryEmbeddingND, ViTAttention, TransformerBlock, ViT3DDecoder,
+      MiniMaxH3VideoVAE) — 609 LOC
+- [x] Implement `convert_video_vae()` in `convert.py` (Conv3d layout permute
+      (O,I,D,H,W)→(O,D,H,W,I), bf16/fp16 output variants)
+- [x] Convert Ref2VA source safetensors: 560 tensors, 2,603,871,032 params,
+      35 conv3d transposed, bf16 output 4.97 GB in 17 s
+- [x] Write `tests/test_h3_video_vae.py`: encoder parity, decoder parity,
+      full round-trip on face image, benchmark
+- [x] Verify all 4 tests pass — encoder 139 dB, decoder 63 dB, round-trip 63 dB
+- [x] Record baseline benchmarks (5f/17f × 384×384)
+- [x] Commit + update `PORT_PLAN.md` + `README.md`
+
+### Phase 2 gotchas discovered
+
+- **MLX has no `mx.flip`** in 0.31.2 — use negative-step slicing `x[..., ::-1, ...]`.
+- **MLX `Conv3d` layout is `(O, D, H, W, I)`** (channel-last for both input and
+  weights); the converter permutes PyTorch `(O, I, D, H, W)` on the way in.
+- **`mx.pad` supports only `constant` and `edge`** — the reference uses
+  `reflect` for spatial padding; we hand-roll reflect via slice-and-flip.
+- **`use_t_isolated_gn=True`** in the config: GroupNorm3D reshapes 5-D input
+  so that stats are computed per-frame. Our `TemporalIsolatedGroupNorm` does
+  this directly on NDHWC to avoid a costly permute.
+- **`qk_norm_affine=False`** → RMSNorm on q/k has *no* learnable weight and
+  produces zero checkpoint keys. We keep only the functional path.
+- **Model is designed for 17-frame clips**, not single images: the reference
+  itself only round-trips a single image at ~15 dB (patch_size_t=4 means
+  1 frame → 1 latent token → 4 output frames; the middle frames are
+  interpolated). MLX matches the reference within 0.02 dB — the port is
+  bit-faithful; the low absolute PSNR is intrinsic to the model on images.
+- **Peak RSS is dominated by weights**: 5.0 GB bf16 static + ~0.3 GB peak
+  activation for 17f × 384×384 = 5.3 GB total. Fits in any recent M-series.
+- **Skipped for Phase 2 (deferred to Phase 4/7):** spatial tiling
+  (`tile_size=256`), multi-clip temporal chunking with overlap-blend, and the
+  `token_drop` cross-clip alignment. Fast path only.
 <parameter name="timeout_ms">10000
