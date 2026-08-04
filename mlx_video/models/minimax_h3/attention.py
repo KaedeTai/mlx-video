@@ -81,10 +81,16 @@ class H3Attention(nn.Module):
         s = x.shape[0]
         H, D = self.heads, self.head_dim
         qkv = self.qkv_proj(x)                           # [S, 3*inner]
-        q, k, v = mx.split(qkv, 3, axis=-1)              # each [S, inner]
-        q = q.reshape(s, H, D)
-        k = k.reshape(s, H, D)
-        v = v.reshape(s, H, D)
+        # Raw MiniMax H3 checkpoint stores fused QKV per-head-interleaved:
+        #   [head0.q(D), head0.k(D), head0.v(D), head1.q(D), head1.k(D), head1.v(D), ...]
+        # Reshape to [S, H, 3, D] and select each stream (matches the ComfyUI/diffusers
+        # load-time `_reorder_grouped_qkv_to_qkv` transform without materializing a
+        # rearranged weight tensor). See scripts/convert_minimax_h3_to_diffusers.py in
+        # diffusers PR #14355 (`reorder_interleaved_qkv`) for the source-of-truth spec.
+        qkv = qkv.reshape(s, H, 3, D)                    # [S, H, 3, D]
+        q = qkv[:, :, 0, :]                              # [S, H, D]
+        k = qkv[:, :, 1, :]
+        v = qkv[:, :, 2, :]
 
         # Per-head RMSNorm on q/k
         q = self.q_norm(q)
