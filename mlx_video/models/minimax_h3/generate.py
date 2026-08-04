@@ -68,7 +68,7 @@ def main():
     p.add_argument("--width", type=int, default=384)
     p.add_argument("--height", type=int, default=384)
     p.add_argument("--length", type=int, default=5, help="frame count (snaps to 17k+5 grid)")
-    p.add_argument("--num-steps", type=int, default=15)
+    p.add_argument("--num-steps", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--model-root", default="~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-bf16")
     p.add_argument("--output", default="~/tmp/h3_mlx_smoke_test.mp4")
@@ -77,6 +77,10 @@ def main():
     p.add_argument("--text-encoder-path", default=None,
                    help="Path to Qwen3-VL MLX checkpoint; falls back to DummyTextEncoder if omitted")
     p.add_argument("--text-encoder-truncate-layer", type=int, default=50)
+    p.add_argument("--sampler", default="euler", choices=["euler", "dpmpp_2m"],
+                   help="Denoising sampler (default: euler)")
+    p.add_argument("--shift-video", type=float, default=None,
+                   help="Override scheduler.shift_video (default 12.0)")
     args = p.parse_args()
 
     from .pipeline import load_pipeline
@@ -88,7 +92,12 @@ def main():
         text_encoder_path=args.text_encoder_path,
         text_encoder_truncate_layer=args.text_encoder_truncate_layer,
     )
-    print("[generate] pipeline loaded")
+    # Override scheduler sampler / shift if the CLI asked for it.
+    pipe.scheduler.sampler = args.sampler
+    if args.shift_video is not None:
+        pipe.scheduler.shift_video = float(args.shift_video)
+    print(f"[generate] pipeline loaded (sampler={pipe.scheduler.sampler}, "
+          f"shift_video={pipe.scheduler.shift_video})")
 
     ref_image_latent = None
     if args.ref_image:
@@ -99,8 +108,14 @@ def main():
             raise SystemExit("PIL required for --ref-image")
         img = Image.open(args.ref_image).convert("RGB").resize((args.width, args.height))
         arr = np.asarray(img, dtype=np.float32) / 255.0  # HWC in [0,1]
-        # normalize per imagenet, then reshape to NCHW [-1,1] via pipeline convention
-        arr = (arr - np.array(IMAGENET_MEAN, dtype=np.float32)) / np.array(IMAGENET_STD, dtype=np.float32)
+        # video_vae.encode expects input in [-1, 1] (the encoder internally does
+        # (x + 1) * 0.5 to bring it back to [0, 1] and then applies the imagenet
+        # normalization once).  Feeding an already-imagenet-normalized tensor
+        # here applies the imagenet transform twice -- a severe "frosted glass"
+        # bug: nonlinear per-channel warp on the ref image, coarse identity
+        # survives but high-freq detail is destroyed.  See PIPELINE_NOTES.md
+        # (Phase 8.6 "sharpen output" fix).
+        arr = arr * 2.0 - 1.0                                  # HWC in [-1, 1]
         # video_vae expects [B, C, T, H, W]
         arr = arr.transpose(2, 0, 1)[None, :, None, :, :]  # (1,3,1,H,W)
         ref_x = mx.array(arr)
