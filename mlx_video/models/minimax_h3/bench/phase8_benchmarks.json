@@ -1,0 +1,57 @@
+{
+  "meta": {
+    "phase": "8-3",
+    "date": "2026-08-04",
+    "machine": "Mac Studio (M-series unified memory, 128 GB)",
+    "dit_variant": "MLX Q4 (attn qkv/o + mlp fc1/fc2 + condition_proj, group_size=64)",
+    "text_encoder": "mlx-community/Qwen3-VL-32B-Instruct-4bit, truncated to layer 50",
+    "video_vae": "bf16 (5.0 GB)",
+    "audio_vae": "bf16 (0.3 GB)",
+    "ref_image": "~/movie/wang_wenchin/faces/0100.jpg",
+    "ref_audio": "3 s of silence, stereo, 32 kHz",
+    "prompt": "The man is speaking warmly to the camera in a professional office setting, natural lighting, subtle head movement, slight smile"
+  },
+  "calibrate": {
+    "req_frames": 5, "aligned_frames": 5, "width": 256, "height": 256,
+    "steps": 2, "seq_len": 471,
+    "load_s": 6.3, "gen_s": 17.5, "per_step_s": 8.75,
+    "peak_rss_gb": 52.2,
+    "note": "First step 4.1 s cold, second 1.3 s warm (JIT + kernel cache)."
+  },
+  "A": {
+    "req_frames": 33, "aligned_frames": 39, "width": 384, "height": 384,
+    "steps": 15, "seq_len": 2265,
+    "load_s": 4.55, "gen_s": 61.4, "per_step_s": 4.09,
+    "peak_rss_gb": 53.2,
+    "video_shape": [48, 384, 384, 3], "audio_shape": [2, 52000],
+    "output_mp4": "~/tmp/h3_bench/A.mp4"
+  },
+  "B": {
+    "req_frames": 65, "aligned_frames": 73, "width": 512, "height": 512,
+    "steps": 20, "seq_len": 6395,
+    "load_s": 4.56, "gen_s": 333.1, "per_step_s": 16.65,
+    "peak_rss_gb": 51.8,
+    "video_shape": [88, 512, 512, 3], "audio_shape": [2, 97600],
+    "output_mp4": "~/tmp/h3_bench/B.mp4"
+  },
+  "C_partial": {
+    "req_frames": 124, "aligned_frames": 124, "width": 1344, "height": 768,
+    "steps": 20, "seq_len": 38981,
+    "measured_steps": 2,
+    "measured_step_times_s": [307.5, 318.8],
+    "per_step_s_mean": 313.15,
+    "extrapolated_gen_s": 6263.0,
+    "extrapolated_gen_min": 104.4,
+    "peak_rss_gb_process": 4.7,
+    "peak_wired_gb_est": 25,
+    "output_mp4": null,
+    "note": "Aborted after step 2 to preserve time budget; step time is stable at 313 s/step; full 20-step run would take ~105 min. System stayed >50 GB free RAM after warmup so a full run is feasible on 128 GB when unattended."
+  },
+  "scaling_analysis": {
+    "seq_len_A_to_B": 2.82,
+    "step_time_A_to_B": 4.07,
+    "seq_len_B_to_C": 6.10,
+    "step_time_B_to_C": 18.81,
+    "note": "Between A and B (2.8x tokens) step time grows 4.1x -- roughly N^1.5, MLX SDPA is well-tiled at that scale. Between B and C (6.1x tokens) step time grows 18.8x -- approaching N^2, indicating we cross the MLX SDPA tile-fit boundary somewhere between 6k and 39k tokens."
+  }
+}

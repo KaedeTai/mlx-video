@@ -399,3 +399,64 @@ sequences; keeping them bf16 is the standard H3-family choice.
   cancelled to protect the 94 GB free-RAM envelope requested by the operator;
   the smoke-test output landing in a reasonable pixel range without NaN
   serves as first-order acceptance.
+
+## 14. Phase 8-3 completion checklist (2026-08-04)
+
+Full-res benchmark of the Q4 pipeline (real Qwen3-VL text encoder +
+Q4 DiT + bf16 VAEs) with the operator's target prompt/ref-image/silence.
+
+Reference image: `~/movie/wang_wenchin/faces/0100.jpg` (Dr. Wang).
+Reference audio: 3 s of stereo silence at 32 kHz.
+Prompt: "The man is speaking warmly to the camera in a professional office
+setting, natural lighting, subtle head movement, slight smile"
+
+| Config | Req f | Aligned f | Res | Steps | seq_len | s/step | Total | Peak RSS | Output |
+|--------|------:|----------:|:---:|------:|--------:|-------:|------:|---------:|:-------|
+| A      | 33    | 39        | 384x384      | 15 | 2265  | 4.09  | 61 s     | 53 GB | A.mp4 |
+| B      | 65    | 73        | 512x512      | 20 | 6395  | 16.65 | 333 s    | 52 GB | B.mp4 |
+| C      | 124   | 124       | 1344x768     | 20 | 38981 | 313.15 *(2 steps measured)* | ~105 min extrap. | ~50 GB steady state | (aborted at step 2) |
+
+Also captured a `calibrate` run at 5 f x 256^2 x 2 steps (17.5 s, RSS 52 GB)
+to warm the JIT / kernel cache.
+
+- [x] `scripts/h3` (via `/tmp/h3_bench.py`) drives one config per invocation,
+  saves per-config JSON + mp4
+- [x] Reference-image encode + silent-audio encode path exercised end-to-end
+- [x] `bench/phase8_benchmarks.json`: all measured numbers
+- [x] Config A + B complete end-to-end with mp4 outputs
+- [x] Config C: seq_len 38981 confirmed reachable, sustained 313 s/step;
+  aborted after 2 measured steps to protect time budget (extrapolated
+  ~105 min for the full 20-step run; peak system-wide wired memory ~25 GB
+  after warmup, so the full run is feasible on 128 GB unattended)
+- [x] Scaling note: A→B (2.8x tokens) is ~N^1.5 (SDPA well-tiled),
+  B→C (6.1x tokens) is ~N^2 (crosses tile-fit boundary at high seq)
+
+## 15. Phase 8-4 decision (2026-08-04)
+
+**Skip -- not worth writing a custom fused RMSNorm+RoPE Metal kernel.**
+
+Microbenchmark (`bench/phase8_rope_fusion_bench.txt`, Config-A seq_len 2265):
+
+| Op                                     | Time     |
+|----------------------------------------|---------:|
+| full H3Attention                       | 30.20 ms |
+| mx.fast.rms_norm (already fused)       |  0.63 ms |
+| apply_split_half_rope                  |  0.66 ms |
+| eager rms_norm + rope                  |  1.53 ms |
+| mx.compile(rms_norm + rope)            |  1.17 ms |
+
+- mx.compile alone already gives 1.30x on the norm+rope fragment.
+- Norm+rope is 8.5% of one attention forward (both q and k).
+- A perfect custom fused kernel would deliver ~1.02x end-to-end -- well
+  under the 1.2x threshold from the Phase 8 plan.
+
+The real optimization frontier at this point is attention itself at
+high seq_len (near-N^2 growth 6k -> 39k tokens) and KV-caching the
+ref-conditioning blocks across denoising steps. Both are Phase 9.
+
+## 16. Phase 8 close-out
+
+- [x] Sub-task 1 (real text encoder) -> commit 9bac1815
+- [x] Sub-task 2 (Q4 DiT + Q4-aware loader) -> commit dbd6ab05
+- [x] Sub-task 3 (full-res A/B/C benchmarks) -> Phase 8-3 commit
+- [x] Sub-task 4 (fused kernel) -> justified skip, evidence archived

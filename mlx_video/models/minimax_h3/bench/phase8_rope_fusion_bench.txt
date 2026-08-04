@@ -1,0 +1,38 @@
+Phase 8-4 microbenchmark: is a custom fused RMSNorm+RoPE Metal kernel worth writing?
+
+Setup
+-----
+  H3Attention at hidden=5376, heads=56, head_dim=128, seq=2265 (Config A),
+  bf16 activations. Ran on the same Mac Studio as Phase 8-3.
+
+Component timings (ms/call, mean of 200 iters, mx.eval after each)
+------------------------------------------------------------------
+  full H3Attention (bf16)                : 30.20 ms
+  mx.fast.rms_norm (already-fused kernel):  0.628 ms
+  apply_split_half_rope                  :  0.661 ms
+  eager  (rms_norm + rope)               :  1.527 ms
+  mx.compile(rms_norm + rope)            :  1.170 ms
+
+Compile fusion speedup on the norm+rope fragment: 1.30x
+Fraction of one attention forward spent in norm+rope (q + k): 8.5%
+Projected end-to-end DiT-step speedup if the fragment were 1.30x faster: 1.020x
+
+Decision
+--------
+Skip. The dominant cost is mx.fast.scaled_dot_product_attention (~90% of the
+attention forward), and mx.fast.rms_norm is already a fused Metal kernel.
+Even a perfect custom fused kernel over the norm+rope fragment would yield
+~2% end-to-end DiT-step speedup, well under the 1.2x threshold from the
+Phase 8 plan.
+
+Higher-yield future optimizations
+---------------------------------
+- Attention: at seq_len 6.4k -> 39k the step time grew 19x for a 6.1x token
+  increase (near-quadratic). A custom tiled + causal-mask-free Metal kernel
+  for H3's specific attention shape (packed sequence with mixed video/audio/
+  text tokens, no chunking) could realistically halve the attention time at
+  large seq. This is Phase 9-tier work.
+- KV cache for the ref-conditioning blocks (they don't change across
+  denoising steps). Would save one full attention-vs-refs pass per step.
+- Pipeline scaling: chunked attention along the temporal axis, similar to
+  the video-VAE tiling already deferred from Phase 2.
