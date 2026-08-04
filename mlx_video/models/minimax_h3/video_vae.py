@@ -689,6 +689,14 @@ class MiniMaxH3VideoVAE(nn.Module):
 
         self.clip_length = clip_length
         self.token_drop = token_drop
+        # Derived quantities for decode_temporal (Phase 8.9-a port).
+        # Mirrors ComfyUI comfy/ldm/minimax/vae.py:346-351.
+        self.tokens_chunk_size = int(math.ceil(clip_length / self.vae_ratio_t))
+        self.frame_pre_padding = (-clip_length) % self.vae_ratio_t
+        self.token_overlap = (-token_drop) % self.tokens_chunk_size
+        self.frame_overlap = max(
+            self.token_overlap * self.vae_ratio_t - self.frame_pre_padding, 0
+        )
         self.tile_size = tile_size
         self.tile_overlap_min = tile_overlap_min
         self.tiling = tiling
@@ -754,6 +762,144 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     def _decode_pixels_ndhwc(self, z_ndhwc: mx.array) -> mx.array:
         return self.decoder(self.post_quant_conv(z_ndhwc))
+
+    # ------------------------------------------------------------------
+    # Phase 8.9-a: temporal chunk decode with overlap + cross-fade.
+    # Ported from ComfyUI comfy/ldm/minimax/vae.py:426-651. NDHWC layout,
+    # so the temporal axis is axis=1 (not axis=2 as in the torch NCDHW ref).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _blend_axis1(a: "mx.array", b: "mx.array", blend_extent: int) -> "mx.array":
+        """Linear cross-fade of ``a``'s tail into ``b``'s head along axis=1.
+
+        Returns ``concat([blend, b_tail], axis=1)`` where ``blend`` has length
+        ``blend_extent`` and ``b_tail = b[:, blend_extent:]``.
+        """
+        blend_extent = int(min(a.shape[1], b.shape[1], blend_extent))
+        if blend_extent <= 0:
+            return b
+        pos = mx.arange(blend_extent, dtype=b.dtype)
+        w_b = (pos / blend_extent).reshape(1, blend_extent, 1, 1, 1)
+        w_a = 1.0 - w_b
+        a_tail = a[:, -blend_extent:, :, :, :]
+        b_head = b[:, :blend_extent, :, :, :]
+        blended = a_tail * w_a + b_head * w_b
+        if blend_extent < b.shape[1]:
+            return mx.concatenate([blended, b[:, blend_extent:, :, :, :]], axis=1)
+        return blended
+
+    def _decode_temporal_pad_frames(self, z_len: int, pad_tokens: int) -> int:
+        if pad_tokens <= 0:
+            return 0
+        intra_tail = self.clip_length % self.vae_ratio_t
+        if intra_tail == 0:
+            return pad_tokens * self.vae_ratio_t
+        z_len_before_pad = z_len - pad_tokens
+        return sum(
+            intra_tail if (z_len_before_pad + k) % self.tokens_chunk_size == 0
+            else self.vae_ratio_t
+            for k in range(pad_tokens)
+        )
+
+    def _decode_temporal_frame_plan(self, z_len: int, num_chunks: int, pad_tokens: int) -> int:
+        chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
+        split_count = int(self.token_drop > 0) + 1
+        total_frames = 0
+        final_overlap_frames = 0
+        for i in range(num_chunks):
+            t_start_idx = i * self.tokens_chunk_size
+            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
+            clip_token_len = max(0, min(t_end_idx, z_len) - min(t_start_idx, z_len))
+            clip_frame_len = clip_token_len * self.vae_ratio_t
+            for j in range(split_count):
+                f_start_idx = j * chunk_dec
+                f_end_idx = min(f_start_idx + chunk_dec, clip_frame_len)
+                chunk_frames = max(0, f_end_idx - f_start_idx - self.frame_pre_padding)
+                if j == 0:
+                    total_frames += chunk_frames
+                else:
+                    final_overlap_frames = chunk_frames
+        total_frames += final_overlap_frames
+        return total_frames - self._decode_temporal_pad_frames(z_len, pad_tokens)
+
+    def decode_temporal_ndhwc(self, z: "mx.array") -> "mx.array":
+        """NDHWC decode_temporal. ``z`` is (B, T_lat, H_lat, W_lat, C_z)."""
+        chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
+        split_count = int(self.token_drop > 0) + 1
+
+        T_lat = z.shape[1]
+        pseudo_total_tokens = T_lat + self.token_drop
+
+        pad_tokens = 0
+        remainder = pseudo_total_tokens % self.tokens_chunk_size
+        if remainder != 0:
+            pad_tokens = self.tokens_chunk_size - remainder
+            pseudo_total_tokens += pad_tokens
+
+        num_chunks = pseudo_total_tokens // self.tokens_chunk_size - int(self.token_drop > 0)
+        if num_chunks < 1:
+            pad_tokens += self.tokens_chunk_size
+            num_chunks += 1
+
+        if pad_tokens > 0:
+            pad_z = mx.broadcast_to(
+                z[:, -1:, :, :, :],
+                (z.shape[0], pad_tokens, z.shape[2], z.shape[3], z.shape[4]),
+            )
+            z = mx.concatenate([z, pad_z], axis=1)
+
+        output_frames = self._decode_temporal_frame_plan(z.shape[1], num_chunks, pad_tokens)
+
+        parts = []          # list of (write_pos, part) tuples
+        dec_overlap = None
+        write_pos = 0
+        first_dtype = None
+        first_shape_tail = None  # (H, W, C)
+
+        for i in range(num_chunks):
+            t_start_idx = i * self.tokens_chunk_size
+            t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
+            clip_z = z[:, t_start_idx:t_end_idx, :, :, :]
+
+            clip_dec = self._decode_pixels_ndhwc(clip_z)
+            if first_dtype is None:
+                first_dtype = clip_dec.dtype
+                first_shape_tail = clip_dec.shape[2:]
+
+            for j in range(split_count):
+                f_start_idx = j * chunk_dec
+                f_end_idx = min(f_start_idx + chunk_dec, clip_dec.shape[1])
+                clip_dec_chunk = clip_dec[:, f_start_idx:f_end_idx, :, :, :]
+                clip_dec_chunk = clip_dec_chunk[:, self.frame_pre_padding:, :, :, :]
+
+                if j == 0:
+                    if dec_overlap is not None:
+                        clip_dec_chunk = self._blend_axis1(
+                            dec_overlap, clip_dec_chunk, self.frame_overlap
+                        )
+                        dec_overlap = None
+                    part_frames = clip_dec_chunk.shape[1]
+                    copy_frames = min(part_frames, max(0, output_frames - write_pos))
+                    if copy_frames > 0:
+                        parts.append(clip_dec_chunk[:, :copy_frames, :, :, :])
+                        write_pos += copy_frames
+                else:
+                    dec_overlap = clip_dec_chunk
+
+            if i == num_chunks - 1 and dec_overlap is not None:
+                part_frames = dec_overlap.shape[1]
+                copy_frames = min(part_frames, max(0, output_frames - write_pos))
+                if copy_frames > 0:
+                    parts.append(dec_overlap[:, :copy_frames, :, :, :])
+                    write_pos += copy_frames
+                dec_overlap = None
+
+        if not parts:
+            # Should not happen for T_lat >= 1, but keep a safe empty tensor.
+            return mx.zeros(
+                (z.shape[0], 0) + first_shape_tail, dtype=first_dtype or z.dtype
+            )
+        return mx.concatenate(parts, axis=1)
 
     def encode(self, x: mx.array) -> mx.array:
         """Encode NCDHW pixels in [-1, 1] to normalized latents (mean only).
@@ -873,15 +1019,9 @@ class MiniMaxH3VideoVAE(nn.Module):
             dec = self._decode_pixels_ndhwc(z)
             dec = dec[:, -1:, :, :, :]
         else:
-            # Non-overlapping decode of z's temporal chunks (Phase 2 minimal
-            # path, no chunk overlap/blend).
-            outs = []
-            tokens_per_chunk = int(math.ceil(self.clip_length / self.vae_ratio_t))
-            T_lat = z.shape[1]
-            for start in range(0, T_lat, tokens_per_chunk):
-                end = min(start + tokens_per_chunk, T_lat)
-                outs.append(self._decode_pixels_ndhwc(z[:, start:end]))
-            dec = mx.concatenate(outs, axis=1)
+            # Phase 8.9-a: proper temporal chunk decode with overlap +
+            # cross-fade (matches ComfyUI decode_temporal).
+            dec = self.decode_temporal_ndhwc(z)
 
         dec = dec.astype(mx.float32)
         dec = dec * self.pixel_std.astype(dec.dtype) + self.pixel_mean.astype(dec.dtype)
