@@ -243,7 +243,29 @@ def load_pipeline(
 
     cfg = MiniMaxH3Config()
     dit = MiniMaxH3Model(cfg)
-    dit.load_weights(str(model_root / "dit" / "model.safetensors"))
+
+    # Detect Q4 checkpoint and re-quantize the empty model to match layout
+    dit_dir = model_root / "dit"
+    qmeta = dit_dir / "quantization.json"
+    if qmeta.exists():
+        import json as _json
+        import mlx.nn as _nn
+        meta = _json.loads(qmeta.read_text())
+        suffixes = tuple(meta["class_predicate_suffixes"])
+        gs = int(meta["group_size"])
+        bits = int(meta["bits"])
+        def _pred(path, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if not any(path.endswith(s) for s in suffixes):
+                return False
+            w = getattr(m, "weight", None)
+            if w is not None and w.ndim >= 2 and w.shape[-1] % gs != 0:
+                return False
+            return True
+        _nn.quantize(dit, group_size=gs, bits=bits, class_predicate=_pred)
+
+    dit.load_weights(str(dit_dir / "model.safetensors"))
 
     video_vae = MiniMaxH3VideoVAE()
     video_vae.load_weights(str(model_root / "video_vae" / "model.safetensors"), strict=False)

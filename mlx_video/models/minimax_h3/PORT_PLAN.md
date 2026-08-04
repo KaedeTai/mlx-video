@@ -358,3 +358,44 @@ Real Qwen3-VL-32B truncated-at-50 text encoder replaces `DummyTextEncoder`.
 - Cross-framework PSNR vs PyTorch bf16 reference for layer-50 hidden state
   (needs an additional ~64 GB load, does not fit alongside the DiT in this
   cut).
+
+## 13. Phase 8-2 completion checklist (2026-08-04)
+
+MLX 4-bit quantize the DiT heavy Linear layers.
+
+- [x] `scripts/h3/quantize_dit.py`: loads bf16 DiT (33.12 B params),
+  quantizes attn.qkv_proj/out_proj + mlp.fc1/fc2 + condition_proj to
+  4-bit affine, group_size=64
+- [x] Predicate skips Linears whose in-dim % group_size != 0
+  (audio_patch_proj 32-in, video_patch_proj 96-in — trivial params anyway)
+- [x] Saves `mlx-models/MiniMaxH3-Ref2VA-MLX-Q4/dit/model.safetensors`
+  + `quantization.json` (bits, group_size, predicate suffixes, mode)
+- [x] Symlinks video_vae + audio_vae from the bf16 dir
+- [x] `pipeline.load_pipeline` auto-detects `dit/quantization.json` and
+  re-applies the same `nn.quantize` predicate on the empty model before
+  `load_weights`, so Q4 checkpoints load transparently
+- [x] Sizes:
+    - DiT bf16 on disk 62 GB → Q4 35 GB (44% reduction)
+    - Peak RSS 5f × 128² × 3 steps: 22.6 GB (Q4 DiT + Qwen3-VL Q4 encoder
+      + VAE + activations)
+- [x] Smoke test 5f × 128² × 3 steps: 36.4 s wall, video pixel range
+  [45, 147] (no NaN, no clipping), audio in [-1, 1]
+
+### Sizing rationale (why 35 GB not ~10 GB)
+
+The DiT is not "mostly quantizable" — of 33.12 B params, only ~20 B live in
+the heavy Linears we quantize. The remaining ~13 B are AdaLN modulation
+linears (2688 → 6*hidden*modalities = 64512 per block × 50 blocks ≈ 8.7 B),
+token-refiner blocks, time embedder, and patch/head projections. These stay
+bf16 for stability. Quantizing AdaLN too would shave another ~7 GB but
+introduces modulation-scale drift that shows up as color banding on long
+sequences; keeping them bf16 is the standard H3-family choice.
+
+### Notes / follow-ups
+
+- Text encoder is already 4-bit (mlx-community Q4 checkpoint) — no separate
+  quantization step needed for it.
+- Q4 vs bf16 pixel-PSNR spot-check was queued but the bf16 verify run was
+  cancelled to protect the 94 GB free-RAM envelope requested by the operator;
+  the smoke-test output landing in a reasonable pixel range without NaN
+  serves as first-order acceptance.
