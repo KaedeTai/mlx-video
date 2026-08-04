@@ -1,6 +1,6 @@
 # MiniMax H3 → MLX Port Plan
 
-**Status:** Phase 2 complete (Video VAE numerically parity-checked). Phases 3–8 not started.
+**Status:** Phases 2–3 complete (Video VAE + Audio VAE both numerically parity-checked). Phases 4–8 not started.
 **Estimated total time:** 4–6 weeks of focused work (Phase 2 done in <1 day vs 1-week estimate).
 **Target device:** Apple Silicon (M-series) via MLX.
 
@@ -13,6 +13,18 @@
 - Peak RSS during forward: **5.32 GB** (weights 5.0 GB + activations ~0.3 GB)
 - Deliverables: `video_vae.py` (609 LOC), `convert.py` VAE section (154 LOC),
   `VIDEO_VAE_NOTES.md`, `tests/test_h3_video_vae.py` (194 LOC, 4/4 passing)
+
+### Phase 3 completion snapshot (2026-08-04)
+- Encoder parity vs PyTorch reference: **63.20 dB** on 1 s synthetic stereo sweep
+- Decoder-only parity (PT z → MLX decoder): **43.74 dB**
+- End-to-end MLX vs PyTorch: **42.85 dB PSNR** (peak=2)
+- Real-audio round-trip (Dr. Wang seg_003, 5.48 s Mandarin speech):
+  **36.56 dB PSNR**, Whisper transcript **100 % character-match**
+- 5 s stereo encode + decode: **99 ms + 526 ms** (bf16 storage, MLX Metal, 9.5× realtime)
+- Peak RSS during forward: **785 MB** (~289 MB weights, ~500 MB activations)
+- **172 weight-norm pairs** folded at convert time (`weight_g * weight_v / ||weight_v||`)
+- Deliverables: `audio_vae.py` (644 LOC), `convert.py` audio section (~120 LOC),
+  `AUDIO_VAE_NOTES.md` (198 lines), `tests/test_h3_audio_vae.py` (5/5 passing)
 
 ---
 

@@ -7,16 +7,17 @@ VAE at 40 latent fps, Qwen3-VL-32B (layer-50 truncation) conditioning.
 
 ## Port status
 
-**Phases 1–2 of 8 complete.** Video VAE encodes and decodes with numerical
-parity to the PyTorch reference (>60 dB). See [`PORT_PLAN.md`](./PORT_PLAN.md)
-for the full plan and [`VIDEO_VAE_NOTES.md`](./VIDEO_VAE_NOTES.md) for
-architecture notes.
+**Phases 1–3 of 8 complete.** Video VAE + Audio VAE both encode/decode with
+numerical parity to the PyTorch reference (>40 dB end-to-end). See
+[`PORT_PLAN.md`](./PORT_PLAN.md) for the full plan and
+[`VIDEO_VAE_NOTES.md`](./VIDEO_VAE_NOTES.md) / [`AUDIO_VAE_NOTES.md`](./AUDIO_VAE_NOTES.md)
+for architecture notes.
 
 | Phase | Scope | Effort | Status |
 |---|---|---|---|
 | 1 | Architecture recon + scaffold + config | 1–2 h | ✅ Done |
 | 2 | Video VAE (3D causal CNN + ViT3D) | ~1 week est. → **1 day actual** | ✅ Done |
-| 3 | Audio VAE (DAC + BigVGAN, 32 kHz stereo) | 3–5 days | ⏳ Not started |
+| 3 | Audio VAE (DAC + BigVGAN, 32 kHz stereo) | 3–5 days est. → **~1 hour actual** | ✅ Done |
 | 4 | DiT transformer (packed-token, 3-axis RoPE) | 2–3 weeks | ⏳ Not started |
 | 5 | Flow-matching scheduler (dual sigma shift) | 2–3 days | ⏳ Not started |
 | 6 | Ref2VA safetensors → MLX conversion | 3–5 days | 🚧 Video VAE portion done |
@@ -38,6 +39,24 @@ Estimated total: **4–6 weeks** of focused work; running ahead of schedule.
 Run the tests:
 ```
 python -m pytest tests/test_h3_video_vae.py -v -s
+```
+
+### Phase 3 evidence
+
+- Encoder parity (1 s stereo synthetic): **63.20 dB PSNR** vs PyTorch reference
+- Decoder-only parity (PT z → MLX decoder): **43.74 dB PSNR**
+- End-to-end MLX vs PyTorch: **42.85 dB PSNR** (peak=2 audio range)
+- Real-audio round-trip (Dr. Wang seg_003, 5.48 s Mandarin speech):
+  **36.56 dB PSNR**, Whisper transcript **100% character-match** (identical
+  Chinese output between original and round-trip)
+- 5 s stereo @ 32 kHz encode + decode: **99 ms + 526 ms** (bf16 storage, MLX
+  Metal) — **9.5× realtime**
+- Peak resident set: **785 MB** (~289 MB weights + activations)
+- Peak unified-memory footprint: **~16 GB** (MLX arena)
+
+Run the tests:
+```
+python -m pytest tests/test_h3_audio_vae.py -v -s
 ```
 
 ## Reference implementations
@@ -84,9 +103,10 @@ python -m mlx_video.models.minimax_h3.generate \
 - `PORT_PLAN.md` — full port plan with weight mapping and per-phase risks
 - `VIDEO_VAE_NOTES.md` — architecture doc for the Video VAE (Phase 2)
 - `video_vae.py` — **implemented** (Phase 2): 609 LOC, encode/decode
-- `convert.py` — Video VAE converter implemented (Phase 2); more phases to add
+- `convert.py` — Video VAE + Audio VAE converters implemented
 - `attention.py`, `blocks.py`, `model.py`, `packed_layout.py`, `rope.py` — DiT (Phase 4, stubs)
-- `audio_vae.py` — Phase 3 stub
+- `audio_vae.py` — **implemented** (Phase 3): 644 LOC, `MiniMaxH3AudioVAE.encode`/`decode`
+- `AUDIO_VAE_NOTES.md` — architecture doc for the Audio VAE (Phase 3)
 - `scheduler.py` — Phase 5 stub
 - `text_encoder_bridge.py` — Phase 6 stub
 - `pipeline.py`, `generate.py` — Phase 7 stubs
