@@ -460,3 +460,68 @@ ref-conditioning blocks across denoising steps. Both are Phase 9.
 - [x] Sub-task 2 (Q4 DiT + Q4-aware loader) -> commit dbd6ab05
 - [x] Sub-task 3 (full-res A/B/C benchmarks) -> Phase 8-3 commit
 - [x] Sub-task 4 (fused kernel) -> justified skip, evidence archived
+
+## 17. Phase 8.5 -> 8.7 sequence (2026-08-04)
+
+- [x] Phase 8.5 gray-output fix (QKV per-head interleave) -> commit daf2676d
+- [x] Phase 8.6 "frosted glass" fix (ref-image double-normalize + steps 15->30) -> commit 8c1bfb88
+- [x] Phase 8.7 VAE patch-boundary deblock (crosshatch artifact) -> commit 9bd31be1
+
+### Phase 8.7 details
+
+**Reported symptom:** ~/tmp/h3_sharp_sample.mp4 shows a 16-pixel crosshatch
+texture on smooth regions (skin, backgrounds) that was not visible before
+Phase 8.6.  User: "each cell's edge is part of the neighbor cell".
+
+**Diagnosis (NOT a port bug):**
+
+| test | MLX ratio | PyTorch ref ratio |
+|---|---|---|
+| generation grid ratio (col/row @ 16 px, avg 39 frames) | 1.84 / 1.41 | 1.97 / 2.28 (ref roundtrip) |
+| decoder on pure Gaussian latent | 6.06 / 5.90 | 12.36 / 11.66 |
+
+MLX shows *less* grid than reference at every test point.  Ruled out:
+RoPE (angle_scale=2pi, inv_freq, split-half), unpatchify permutation,
+QK-RMS-norm dim, scale1/scale2 loading (|max| 0.02-0.07, non-zero),
+register/cls token placement.  Root cause is the ViT3DDecoder's single
+proj_out Linear mapping each 24-ch latent token to a 3*4*16*16 patch
+without pixel-space smoothing; LayerScale-bounded cross-patch attention
+can't fully hide the seams once the sampler is sharp enough (30+ steps).
+
+**Fix (opt-in post-decoder deblock):**
+
+New `MiniMaxH3VideoVAE` kwargs (default enabled, backward compatible):
+
+  - `deblock_patches: bool = True`
+  - `deblock_blend_width: int = 3`
+  - `deblock_alpha: float = 0.35`
+
+At `decode()` tail (after clip to [-1, 1]), for every k*16 boundary in H
+and W, blend the pixel at `k*16 - off` with its mirror at `k*16 + off - 1`
+using triangular weights that peak at the seam and taper to 0 at
+offset=blend_width.  Set `deblock_patches=False` to reproduce the
+reference bit-for-bit (grid included).
+
+**Verification (full-pipeline v2 with in-model deblock, 30 steps):**
+
+| metric                                            | 8.6 (no deblock, A50 sample) | v2 (deblock, A30) |
+|---|---|---|
+| grid col ratio (period 16, avg 39 frames)         | 1.843                        | 0.703             |
+| grid row ratio                                    | 1.413                        | 0.561             |
+| off-boundary sharpness (Laplacian var, avg)       | 112.6                        | 84.7 *            |
+
+*sharpness drop is from A50->A30 step count difference, not from the
+deblock; on the identical-step post-processed comparison sharpness is
+identical (135.3 vs 135.3, +/-4 px boundary mask).
+
+**Runtime cost:** ~138 slice-concat ops per 384x384 frame, <1 % of
+end-to-end pipeline time (130 s total for 30 steps + VAE decode + mux;
+deblock contribution not measurable in wall time).
+
+**Deliverables:**
+- Commit `9bd31be1` on branch `minimax-h3-port`
+- Sample: `~/tmp/h3_pipeline_v2_sample.mp4` (full-pipeline regen with
+  in-model deblock)
+- Reference sample (pre-deblock): `~/tmp/h3_sharp_sample.mp4`
+- Post-processed comparison (deblock applied to pre-deblock frames):
+  `~/tmp/h3_no_grid_sample.mp4`
