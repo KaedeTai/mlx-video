@@ -102,7 +102,11 @@ class H3Pipeline:
         width: int = 384,
         height: int = 384,
         length: int = 5,
-        num_steps: int = 15,
+        # Phase 8.8: default raised 15 -> 30 to match the CLI. At 15 steps the
+        # final Euler leg integrates a sigma delta of ~-0.46 in a single shot,
+        # which visibly softens output. CLI generate.py already defaulted to 30
+        # (Phase 8.6) but the library API had drifted.
+        num_steps: int = 30,
         seed: int = 0,
         ref_image_latent: Optional[mx.array] = None,
         ref_audio_latent: Optional[mx.array] = None,

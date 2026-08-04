@@ -106,7 +106,14 @@ def main():
             from PIL import Image
         except ImportError:
             raise SystemExit("PIL required for --ref-image")
-        img = Image.open(args.ref_image).convert("RGB").resize((args.width, args.height))
+        # Phase 8.8: use LANCZOS to match ComfyUI (nodes_minimax_h3.py:66 uses
+        # `common_upscale(..., "lanczos", ...)`). PIL's default resample is
+        # BICUBIC (Pillow 10+) which is visibly softer; feeding a softer ref
+        # image as a per-step condition drags the whole generation toward
+        # low-frequency reconstruction.
+        img = Image.open(args.ref_image).convert("RGB").resize(
+            (args.width, args.height), Image.LANCZOS
+        )
         arr = np.asarray(img, dtype=np.float32) / 255.0  # HWC in [0,1]
         # video_vae.encode expects input in [-1, 1] (the encoder internally does
         # (x + 1) * 0.5 to bring it back to [0, 1] and then applies the imagenet

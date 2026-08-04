@@ -670,7 +670,16 @@ class MiniMaxH3VideoVAE(nn.Module):
         tile_size: int = 256,
         tile_overlap_min: int = 64,
         tiling: bool = False,
-        deblock_patches: bool = True,
+        # Phase 8.8: deblock defaulted OFF. It was a post-decode 16-px
+        # boundary low-pass (alpha=0.35, bw=3) added in Phase 8.7 to mask a
+        # crosshatch texture from the ViT3D decoder. In practice it touches
+        # ~60% of output pixels with a 35%-weight mirror blend — precisely
+        # the "frosted glass" the user reported. The ComfyUI reference has
+        # no such pass. The underlying grid must be fixed in the decoder
+        # itself (or via proper tile_overlap in decode_temporal), not
+        # papered over. Set deblock_patches=True to opt back into the
+        # Phase 8.7 band-aid.
+        deblock_patches: bool = False,
         deblock_blend_width: int = 3,
         deblock_alpha: float = 0.35,
     ):

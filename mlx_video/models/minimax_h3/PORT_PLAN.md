@@ -466,6 +466,7 @@ ref-conditioning blocks across denoising steps. Both are Phase 9.
 - [x] Phase 8.5 gray-output fix (QKV per-head interleave) -> commit daf2676d
 - [x] Phase 8.6 "frosted glass" fix (ref-image double-normalize + steps 15->30) -> commit 8c1bfb88
 - [x] Phase 8.7 VAE patch-boundary deblock (crosshatch artifact) -> commit 9bd31be1
+- [x] Phase 8.8 code-review vs ComfyUI: deblock off by default (root-cause fix), library num_steps 15->30 parity, LANCZOS ref resize
 
 ### Phase 8.7 details
 
@@ -525,3 +526,43 @@ deblock contribution not measurable in wall time).
 - Reference sample (pre-deblock): `~/tmp/h3_sharp_sample.mp4`
 - Post-processed comparison (deblock applied to pre-deblock frames):
   `~/tmp/h3_no_grid_sample.mp4`
+
+### Phase 8.8 details (2026-08-05)
+
+**Trigger:** user reported the full pipeline output looked like "frosted
+glass" with a faint grid pattern; prior debugging (isolated 384² VAE
+round-trips) reported no grid excess vs the PyTorch reference, so the
+symptom must have come from something the pixel-stats probes did not
+touch. Focus was moved to pure code review: diff MLX H3 files line-by-line
+against the ComfyUI reference at `/tmp/h3_recon/ComfyUI/` (re-cloned from
+`Comfy-Org/ComfyUI` main after PR #15224 merged native H3 support).
+
+**Diagnosis:** the Phase 8.7 `_deblock_patches` post-decode filter
+(default enabled) is itself a 35%-weight mirror low-pass across every
+16-px boundary, touching ~60% of output pixels — that low-pass IS the
+frosted-glass appearance the user sees. The underlying grid it was
+masking traces to our `decode_temporal` being a non-overlapping stub
+compared to ComfyUI's cross-faded implementation.
+
+**Fixes shipped (this commit):**
+
+  - `video_vae.py:673` — `deblock_patches` default flipped `True → False`
+    (the Phase 8.7 filter remains opt-in for A/B).
+  - `pipeline.py:105` — `H3Pipeline.generate` default `num_steps=15 → 30`
+    (CLI already defaulted to 30 in Phase 8.6; library API had drifted).
+  - `generate.py:109` — ref image resize uses `Image.LANCZOS` (was PIL
+    default = BICUBIC in Pillow 10+, softer than ComfyUI's `common_upscale`
+    with `"lanczos"`).
+
+**Deferred (documented in `~/tmp/h3_code_diff/top_5_bug_candidates.md`):**
+
+  - Root-cause fix for the ViT3D decoder grid: port ComfyUI's
+    `decode_temporal` cross-fade (`token_overlap`, `frame_overlap`,
+    `frame_pre_padding`) — ~50 LOC of careful transcription.
+  - Text encoder: swap 4-bit AWQ Qwen3-VL for the MiniMax 50-layer FP
+    checkpoint and implement the vision-token path per ComfyUI's
+    `text_encoders/minimax.py` (`<|vision_start|>` splicing, DeepStack).
+
+**Artefacts:** full code-review notes and per-file diffs at
+`~/tmp/h3_code_diff/{CODE_DIFF_REPORT.md, top_5_bug_candidates.md,
+per_file_diff/*.md}`.
