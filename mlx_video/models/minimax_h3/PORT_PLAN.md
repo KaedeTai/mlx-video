@@ -467,6 +467,8 @@ ref-conditioning blocks across denoising steps. Both are Phase 9.
 - [x] Phase 8.6 "frosted glass" fix (ref-image double-normalize + steps 15->30) -> commit 8c1bfb88
 - [x] Phase 8.7 VAE patch-boundary deblock (crosshatch artifact) -> commit 9bd31be1
 - [x] Phase 8.8 code-review vs ComfyUI: deblock off by default (root-cause fix), library num_steps 15->30 parity, LANCZOS ref resize
+- [x] Phase 8.9-a decode_temporal cross-fade port (fixes chunk-boundary neighbor-leak) -> commit 37a1cbbd
+- [ ] Phase 8.9-b text-encoder swap + vision splicing (deferred, see Phase 9-1)
 
 ### Phase 8.7 details
 
@@ -566,3 +568,60 @@ compared to ComfyUI's cross-faded implementation.
 **Artefacts:** full code-review notes and per-file diffs at
 `~/tmp/h3_code_diff/{CODE_DIFF_REPORT.md, top_5_bug_candidates.md,
 per_file_diff/*.md}`.
+
+
+### Phase 8.9 details (2026-08-05)
+
+**Bug pattern (user):** 1D illustrative — each temporal chunk boundary
+carries a strip of the adjacent chunk's content. Concrete example:
+expected `111122223333` (3 chunks × 4 frames of identical content), got
+`1112122232333` — each cell's last frame replaced by the next cell's
+value, and neighbor content spliced at every boundary.
+
+**Diff first (Task 4):** ported the ComfyUI ViT3DDecoder unpatchify
+against MLX `video_vae.py:593-649` — flatten order (T→H→W), reshape,
+permute `(0,1,5,2,6,3,7,4)`, register-token concat, `[:num_patches]`
+strip, `_create_token_ids`, RoPE, QK-RMSNorm all match ComfyUI
+byte-for-byte. Off-by-one theories A/B/C/D **all ruled out**.
+
+**Root cause:** MLX `decode()` multi-frame branch was a non-overlapping
+stub that concatenated each ViT3D chunk's raw 20-frame output. Each
+chunk actually contains `frame_pre_padding = 3` leading neighbor-context
+frames plus `token_overlap = 2` extra tokens (= 8 frames) that must be
+cross-faded with the next chunk. Without the trim + `blend()`, every
+17-frame boundary carried a full unblended splice of neighbor content —
+exactly the observed pattern.
+
+**Fix — Phase 8.9-a (commit 37a1cbbd):** port ComfyUI
+`comfy/ldm/minimax/vae.py:426-651` to MLX (`video_vae.py:756-870`).
+Added derived attrs (`tokens_chunk_size=5`, `frame_pre_padding=3`,
+`token_overlap=2`, `frame_overlap=5`) matching Ref2VA config,
+`_blend_axis1` linear cross-fade (bit-exact vs torch reference — 0.0 max
+diff), `_decode_temporal_pad_frames`, `_decode_temporal_frame_plan`, and
+`decode_temporal_ndhwc`. Frame-plan sweep matches ComfyUI exactly for
+T_lat ∈ {2,3,5,7,10,12,15}: 5, 9, 17, 22, 34, 39, 51.
+
+**Verification sample (`~/tmp/h3_phase89_sample.mp4`, 39f × 384², 30 steps,
+Dr. Wang face + 3s silent audio):**
+  - Temporal edge at chunk 0→1 boundary (frames 16→17): **5.07** —
+    smoothly inside the local range (neighbors 5.44, 7.40); no
+    systematic every-17-frame spike (compare pre-fix, which would emit
+    a hard cut).
+  - Spatial 16-px grid ratio: col=1.60, row=1.58 — unchanged from
+    baseline (ViT3D unpatchify grid is a separate concern, not this
+    fix's target).
+  - Per-channel RGB std: 80.8 / 86.3 / 86.7 — healthy variance
+    (not gray, not saturated).
+  - Mid-frame edge: dx=5.77, dy=4.76 — normal image content.
+
+**Skipped — Phase 8.9-b (deferred):** text encoder swap +
+vision-token splicing. Requires (a) 65 GB torch→MLX conversion of
+`~/models/MiniMax-H3-raw/Ref2VA/text_encoder/` (14 bf16 shards) OR
+51 GB fresh download of `Comfy-Org/MiniMax-H3/qwen3vl_32b_minimax_h3_bf16.safetensors`,
+AND (b) full MLX port of the Qwen3-VL vision tower (deepstack + mrope +
+patch embedder) with vision-token splicing per
+`comfy/text_encoders/minimax.py:141-186`. Too large for this session's
+budget after 8.9-a landed. This does NOT re-introduce the 8.9-a
+temporal boundary artifact — it affects img2v conditioning quality
+(reference-image content leakage into text hidden state), not the
+decode path. Move to Phase 9-1.
