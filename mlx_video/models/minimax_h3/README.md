@@ -18,7 +18,7 @@ audio. See `PORT_PLAN.md` for the full plan and per-phase completion notes.
 | `model.py` | `MiniMaxH3Model` (33 B params, batch=1, packed-token DiT) |
 | `scheduler.py` | Dual-shift flow-matching scheduler (video drives; audio derived) |
 | `convert.py` | Ref2VA safetensors → MLX safetensors converter |
-| `text_encoder_bridge.py` | `DummyTextEncoder` placeholder + Phase-8 Qwen3-VL wiring sketch |
+| `text_encoder_bridge.py` | `DummyTextEncoder` (smoke) + `TextEncoderBridge` (real Qwen3-VL Q4, truncated at layer 50) |
 | `pipeline.py` | `H3Pipeline` container + `.generate()` |
 | `generate.py` | CLI entry (ffmpeg mux to mp4) |
 
@@ -53,9 +53,24 @@ python -m mlx_video.models.minimax_h3.generate \
   --output ~/tmp/h3_mlx_smoke_test.mp4
 ```
 
-The pipeline uses a **`DummyTextEncoder`** by default. Video-quality output
-requires the real Qwen3-VL-32B truncated-to-layer-50 text encoder (Phase 8
-scope). Until then the smoke test verifies pipeline plumbing only.
+The pipeline defaults to a **`DummyTextEncoder`** for fast smoke tests. For
+real generation, pass the Qwen3-VL-32B-Instruct-4bit MLX checkpoint:
+
+```bash
+python -m mlx_video.models.minimax_h3.generate \
+  --text-encoder-path ~/models/Qwen3-VL-32B-Instruct-4bit \
+  --model-root ~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-Q4 \
+  --length 33 --width 384 --height 384 --num-steps 15 \
+  --ref-image ~/movie/wang_wenchin/faces/0100.jpg \
+  --prompt "The man is speaking warmly to the camera..." \
+  --output ~/tmp/h3.mp4
+```
+
+Point `--model-root` at the `MLX-Q4` directory to get the 4-bit DiT
+(35 GB vs 62 GB bf16, ~50 GB peak RSS at 33 f x 384^2 vs ~90 GB bf16).
+Both bf16 and Q4 checkpoints load transparently -- the loader detects
+`dit/quantization.json` and re-applies the same predicate before
+`load_weights`.
 
 ## Tests
 
@@ -65,6 +80,7 @@ python -m tests.test_h3_audio_vae     # Phase 3 — 5/5
 python -m tests.test_h3_dit_smoke     # Phase 4 — 3/3
 python -m tests.test_h3_scheduler     # Phase 5 — 5/5
 python -m tests.test_h3_dit_load      # Phase 6 — full-weight load
+python -m pytest tests/test_h3_text_encoder.py  # Phase 8-1 — 3/3
 ```
 
 ## Phase progress
@@ -78,4 +94,5 @@ python -m tests.test_h3_dit_load      # Phase 6 — full-weight load
 | 5 | Dual-schedule scheduler | ✅ done |
 | 6 | Full weight converter | ✅ done (63 GB bf16, 40.7 s) |
 | 7 | Pipeline glue + smoke test | ✅ done (72.6 s / 33 frames × 15 steps) |
-| 8 | Real Qwen3-VL text encoder + 4-bit quant + full-res bench | 🚧 next |
+| 8 | Real Qwen3-VL text encoder + 4-bit quant + full-res bench | ✅ done |
+| 9 | KV-cache for ref blocks; attention tiling at high seq; vision-block Qwen prompt splicing | 📋 planned |
