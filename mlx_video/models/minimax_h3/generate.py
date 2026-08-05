@@ -106,6 +106,7 @@ def main():
         pipe.video_vae.tiling = False
         print("[generate] spatial tiling disabled")
 
+    ref_image_np = None  # Phase 8.9-c: raw HWC [0,1] for text-encoder vision
     ref_image_latent = None
     if args.ref_image:
         import mlx.core as mx
@@ -122,6 +123,10 @@ def main():
             (args.width, args.height), Image.LANCZOS
         )
         arr = np.asarray(img, dtype=np.float32) / 255.0  # HWC in [0,1]
+        # Phase 8.9-c: keep the pre-normalized HWC [0,1] copy for the text
+        # encoder's vision tower; ComfyUI feeds the raw pixel buffer into
+        # process_qwen2vl_images which does its own resize + (2x - 1) norm.
+        ref_image_np = arr.copy()
         # video_vae.encode expects input in [-1, 1] (the encoder internally does
         # (x + 1) * 0.5 to bring it back to [0, 1] and then applies the imagenet
         # normalization once).  Feeding an already-imagenet-normalized tensor
@@ -141,12 +146,29 @@ def main():
         import mlx.core as mx
         try:
             from scipy.io import wavfile
+            from scipy.signal import resample_poly
         except ImportError:
             raise SystemExit("scipy required for --ref-audio")
         sr, wav = wavfile.read(args.ref_audio)
+        vae_sr = int(getattr(pipe.audio_vae, "sample_rate", 32000))
+        if wav.dtype == np.int16:
+            wav = wav.astype(np.float32) / 32768.0
+        elif wav.dtype == np.int32:
+            wav = wav.astype(np.float32) / 2147483648.0
+        else:
+            wav = wav.astype(np.float32)
+        if sr != vae_sr:
+            # Phase 8.9-b bugfix: ComfyUI (_encode_ref_audio) resamples to
+            # audio_vae.sample_rate (32000); prior generate.py fed raw samples
+            # at whatever SR the WAV had, so 48 kHz refs got 1.5x pitch/tempo
+            # shifted before VAE encode -> DiT conditioned on scrambled timbre.
+            from math import gcd
+            g = gcd(sr, vae_sr)
+            wav = resample_poly(wav, vae_sr // g, sr // g, axis=0)
+            print(f"[generate] resampled ref audio {sr}Hz -> {vae_sr}Hz  "
+                  f"(new samples={wav.shape[0]})")
         if wav.ndim == 1:
             wav = np.stack([wav, wav], axis=-1)
-        wav = wav.astype(np.float32) / 32768.0
         # audio_vae expects [1, C=2, T]
         wav_mx = mx.array(wav.T[None, ...])
         ref_audio_latent = pipe.audio_vae.encode(wav_mx)
@@ -159,6 +181,7 @@ def main():
         prompt=args.prompt,
         width=args.width, height=args.height, length=args.length,
         num_steps=args.num_steps, seed=args.seed,
+        ref_image=ref_image_np,
         ref_image_latent=ref_image_latent,
         ref_audio_latent=ref_audio_latent,
         verbose=True,

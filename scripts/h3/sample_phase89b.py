@@ -172,11 +172,29 @@ def main():
 
     ref_audio_latent = None
     if ref_audio_path:
-        from scipy.io import wavfile
-        sr, wav = wavfile.read(ref_audio_path)
+        from scipy.signal import resample_poly
+        # soundfile handles wav+mp3+ogg+flac; falls back to wavfile if missing
+        try:
+            import soundfile as sf
+            wav, sr = sf.read(str(ref_audio_path), dtype='float32', always_2d=False)
+        except (ImportError, RuntimeError):
+            from scipy.io import wavfile
+            sr, wav = wavfile.read(ref_audio_path)
+        vae_sr = int(getattr(pipe.audio_vae, "sample_rate", 32000))
+        if wav.dtype == np.int16:
+            wav = wav.astype(np.float32) / 32768.0
+        elif wav.dtype == np.int32:
+            wav = wav.astype(np.float32) / 2147483648.0
+        else:
+            wav = wav.astype(np.float32)
+        if sr != vae_sr:
+            # Match ComfyUI comfy_extras/nodes_minimax_h3.py:_encode_ref_audio
+            from math import gcd
+            g = gcd(sr, vae_sr)
+            wav = resample_poly(wav, vae_sr // g, sr // g, axis=0)
+            _log(f"resampled ref audio {sr}Hz -> {vae_sr}Hz  (new samples={wav.shape[0]})")
         if wav.ndim == 1:
             wav = np.stack([wav, wav], axis=-1)
-        wav = wav.astype(np.float32) / 32768.0
         wav_mx = mx.array(wav.T[None, ...])
         ref_audio_latent = pipe.audio_vae.encode(wav_mx)
         _log(f"ref_audio_latent shape: {ref_audio_latent.shape}")
