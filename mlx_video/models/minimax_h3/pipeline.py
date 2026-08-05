@@ -126,6 +126,7 @@ class H3Pipeline:
         # 51 GB encoder, then load the DiT (RAM plan B, since encoder + DiT
         # together exceed the 128 GB budget on this machine).
         context: Optional[mx.array] = None,
+        text_token_tags: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """End-to-end t2va (with optional ref image / ref audio).
 
@@ -153,8 +154,12 @@ class H3Pipeline:
         # vision tokens between <|vision_start|>/<|vision_end|> and also
         # collect ``minimax_token_tags`` for the DiT's per-modality adaLN.
         # Phase 8.9-b compat: a pre-computed context bypasses the encoder.
-        text_token_tags = None
+        # Phase 9-2: allow caller to inject text_token_tags when context is pre-computed
+        # (e.g. text-encoder run in a separate process to free VRAM before DiT load).
+        # Without tags the DiT falls back to modality tag 1 for every text row and loses
+        # the segment-level adaLN routing for <Picture>/<Audio>/prompt sub-runs.
         if context is None:
+            text_token_tags = None
             enc_kwargs = dict(
                 has_ref_image=(ref_image_latent is not None or ref_image is not None),
                 has_ref_audio=(ref_audio_latent is not None),

@@ -321,7 +321,7 @@ class H3TextEncoderBridge:
 
     def __init__(
         self,
-        model_path: str = "~/mlx-video/mlx-models/H3-TextEncoder-MLX-bf16",
+        model_path: str = "~/mlx-video/mlx-models/H3-TextEncoder-MLX-mxfp4",
         truncate_layer: int = TRUNC_LAYERS,
         load_vision: bool = True,
         dtype_fp32_out: bool = True,
@@ -378,6 +378,25 @@ class H3TextEncoderBridge:
             model_class.VisionModel, weights, model_config.vision_config)
         weights = _sanitize_weights(
             model_class.LanguageModel, weights, model_config.text_config)
+
+        # Phase 8.9-d: if the saved checkpoint is quantized (mxfp4/affine),
+        # nn.quantize the target model with a predicate that matches ONLY
+        # the layers whose ``.scales`` are present in ``weights``. This
+        # lets us keep vision tower + deepstack + embed_tokens in bf16
+        # while the 50 language-model decoder blocks live at 4-bit.
+        _q = config.get("quantization") or config.get("quantization_config")
+        if _q is not None:
+            import mlx.nn as _nn
+            def _quant_pred(_p, _m):
+                if not hasattr(_m, "to_quantized"):
+                    return False
+                return f"{_p}.scales" in weights
+            _nn.quantize(
+                model,
+                group_size=_q["group_size"], bits=_q["bits"],
+                mode=_q.get("mode", "affine"),
+                class_predicate=_quant_pred,
+            )
 
         # strict=False: allow missing lm_head + final norm (H3 doesn't use them)
         model.load_weights(list(weights.items()), strict=False)

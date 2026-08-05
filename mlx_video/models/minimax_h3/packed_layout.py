@@ -27,7 +27,7 @@ import numpy as np
 FRAME_PER_TOKEN: Tuple[int, int, int, int, int] = (1, 4, 4, 4, 4)
 FRAME_RESCALE: float = 5.0 / 3.0
 VISUAL_COND_TIMESTEP: float = 0.999
-AUDIO_COND_TIMESTEP: float = 1.0
+AUDIO_COND_TIMESTEP: float = 0.0
 
 
 def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> np.ndarray:

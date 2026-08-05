@@ -270,7 +270,12 @@ class MiniMaxH3Model(nn.Module):
         seg_t = {
             "text": t_v, "video": t_v, "audio": t_a,
             "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
-            "ref_audio": max(t_a, aud_aug),
+            # ref-audio rows are pinned at condition_audio_timestep (== aud_aug),
+            # NOT max(t_a, aud_aug). Pipenetwork uses aud_aug=0.0 (fully clean ref
+            # content); the prior max(...) held ref rows at t=1.0 (pure noise) when
+            # aud_aug was mistakenly 1.0 (see AUDIO_COND_TIMESTEP fix in
+            # packed_layout.py). This is the second half of the ref_blocks port.
+            "ref_audio": aud_aug,
         }
         distinct = {t_v, t_a}
         if has_vis_cond:
