@@ -377,10 +377,13 @@ class MiniMaxH3Model(nn.Module):
         video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
         audio_out = unpack_audio(a_out)
 
-        slope_a = time_shift_slope(sigma_v_val, shift_v, shift_a)
-        video_ret = (-video_out).astype(video_x.dtype)
-        audio_ret = ((-slope_a) * audio_out).astype(audio_x.dtype)
-        return [video_ret, audio_ret]
+        # Port match: pipenetwork's dit returns raw data-ward velocities; scheduler
+        # applies the pipenetwork denoise-blend step formula. Prior code returned
+        # (-video_out, -slope_a * audio_out) to compensate for a plain-Euler
+        # step that overshoots in the early sigma=1 region — that combo produced
+        # a monotone-tone audio failure (see willy_flagship_voice_clone_260806.md).
+        # Sign is now data-ward on both branches; audio has its own sigma schedule.
+        return [video_out.astype(video_x.dtype), audio_out.astype(audio_x.dtype)]
 
 
 # ---------------------------------------------------------------------------

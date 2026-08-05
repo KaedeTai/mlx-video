@@ -99,9 +99,31 @@ class MiniMaxH3Scheduler:
         sigma_cur: float, sigma_next: float,
         x_v: mx.array, x_a: mx.array,
     ) -> Tuple[mx.array, mx.array]:
-        d_sigma = sigma_next - sigma_cur  # negative (denoising)
-        x_v_next = x_v + model_v * d_sigma
-        x_a_next = x_a + model_a * d_sigma
+        # Pipenetwork denoise-blend step (matches ComfyUI model_sampling.step):
+        # given data-ward velocity v, denoised = x + (1 - sigma) * v
+        # then x_next = r * x + (1 - r) * denoised, r = sigma_next / sigma.
+        # This differs from plain-Euler by weighting the step by (1 - sigma):
+        # at sigma=1 (pure noise) no movement, at sigma=0 fully denoised.
+        # Video schedules on the video sigmas.
+        r_v = sigma_next / sigma_cur if sigma_cur > 0 else 0.0
+        denoised_v = x_v + (1.0 - sigma_cur) * model_v
+        x_v_next = r_v * x_v + (1.0 - r_v) * denoised_v
+        # Audio schedules on its own sigma progression derived from sigma_shift_audio.
+        # Compute audio sigma at same base-t as video sigma.
+        # sigma_a_cur = time_snr_shift(shift_audio, base_t_cur), same for next.
+        # base_t = sigma_v when shift_v = 1; but in general, base_t is what we
+        # started from. We can invert time_snr_shift(shift_v, t) = sigma_v.
+        def _inverse_snr(shift, sig):
+            if shift == 1.0 or sig == 0.0:
+                return sig
+            return sig / (shift - (shift - 1.0) * sig)
+        base_cur = _inverse_snr(self.shift_video, sigma_cur)
+        base_nxt = _inverse_snr(self.shift_video, sigma_next)
+        sigma_a_cur = time_snr_shift(self.shift_audio, base_cur)
+        sigma_a_nxt = time_snr_shift(self.shift_audio, base_nxt)
+        r_a = sigma_a_nxt / sigma_a_cur if sigma_a_cur > 0 else 0.0
+        denoised_a = x_a + (1.0 - sigma_a_cur) * model_a
+        x_a_next = r_a * x_a + (1.0 - r_a) * denoised_a
         return x_v_next, x_a_next
 
     # ------------------------------------------------------------------
