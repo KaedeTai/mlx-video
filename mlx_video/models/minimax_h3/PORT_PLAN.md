@@ -625,3 +625,68 @@ budget after 8.9-a landed. This does NOT re-introduce the 8.9-a
 temporal boundary artifact — it affects img2v conditioning quality
 (reference-image content leakage into text hidden state), not the
 decode path. Move to Phase 9-1.
+
+## 18. Phase 8.11 sequence (2026-08-05)
+
+- [x] Phase 8.11-1: port ComfyUI spatial `tiled_encode` / `tiled_decode`
+  (commit `24af4414`). Overlapping tiles with linear cross-fade in the
+  overlap band; tile_size=256, tile_overlap_min=64. Default
+  `tiling=False → True` to match ComfyUI. Wired into both encode() and
+  the multi-clip decode path via `_adaptive_encode_ndhwc` /
+  `_adaptive_decode_ndhwc`.
+- [x] Phase 8.11-3: DiT-latent FFT dump diagnostic (same commit).
+  `pipeline.generate(..., dump_latent_path=)` writes the post-denoise,
+  pre-VAE latent to `.npy`. New CLI flags: `--dump-latent PATH` and
+  `--no-tiling` (for A/B compare). New script:
+  `scripts/h3/analyze_dit_latent.py` runs numpy 2D FFT on the latent
+  and the decoded mp4, reporting peak ratios at fx=1/16-px band.
+  Driver: `scripts/h3/phase811_samples.sh`.
+- [ ] Phase 8.11-2: real text encoder + vision splicing. Blocked by
+  ~51 GB download and full Qwen3-VL vision-tower MLX port (see 8.9-b
+  block above). Scaffolding remains at `text_encoder_bridge.py`
+  (`load_vision=False`).
+
+### Phase 8.10 investigation carried over
+
+Phase 8.10's conclusion that the 16-px grid was "not a port bug" was
+challenged by the user (public H3 scores are higher than Seedance 2.0,
+which would be impossible with a visible grid). Phase 8.11 tests the
+alternative that the grid is upstream of the VAE (in the DiT or
+conditioning) via the FFT dump. Verdict recorded in the sample-run log
+after `bash scripts/h3/phase811_samples.sh` finishes.
+
+### Hypotheses F/H/I/J status (Phase 8.11 code-review)
+
+- **F. RoPE inv_freq periods vs 16.** For dim=48, base=100, n_dim=3 the
+  8 inv_freq values give pixel-space periods of 192, 341, 607, 1080,
+  1920, 3415, 6072, 10799 px — none land on 16 px. RoPE cannot excite a
+  16-px resonance on its own. Ruled out.
+- **H/I. Packed-sequence attention mask.** The VAE ViT3D decoder uses
+  **plain global attention** over 2885 tokens with no mask, matching
+  ComfyUI (`optimized_attention(..., mask=None)`) and Ref2VA
+  (`flash_attn(q,k,v)`  with no `mask_mod`). The DiT also uses
+  `mask=None` per `comfy/ldm/minimax/model.py:181` and our
+  `H3Attention.__call__` at `blocks.py:207` matches. Ruled out for the
+  VAE decoder path; the DiT is exercised via the Phase 8.11-3 latent
+  FFT.
+- **J. QK norm / LayerScale init.** VAE decoder `to_qkv` per-head QKV
+  interleave is correct (`.reshape(B, N, H, 3*D_h)` then
+  `mx.split(3, axis=-1)` — bit-identical layout to ComfyUI's
+  `.view(B, N, -1, 3*D_h).chunk(3, dim=-1)`). QK RMSNorm has no
+  learnable scale (`qk_norm_affine=false`); MLX passes `None` weight;
+  matches ref. Scale1/scale2 loaded from checkpoint; per-block |max|
+  values 0.02..0.06 (block 22 is the largest at 0.061); range matches
+  reference dump.
+- **G. DiT-latent grid.** Not yet run; use
+  `bash scripts/h3/phase811_samples.sh` and read the
+  `analyze_dit_latent.py` output. If latent col/row ratio at fx=1/16
+  is > 1.2, the bug is upstream (DiT or conditioning). Otherwise it is
+  confined to the ViT decoder's per-patch proj_out projection.
+
+### What's still untested after this commit (v2 was blocked)
+
+1. Real qwen3vl_32b_minimax_h3_bf16 text encoder + vision splicing —
+   requires a ~51 GB download + full Qwen3-VL vision-tower MLX port.
+2. Fresh sample generation with tiling enabled (this commit changed
+   the default). User to run `bash scripts/h3/phase811_samples.sh` and
+   report the ratios.
