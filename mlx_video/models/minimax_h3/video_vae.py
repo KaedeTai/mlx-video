@@ -669,12 +669,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         token_drop: int = 3,
         tile_size: int = 256,
         tile_overlap_min: int = 64,
-        # Phase 8.11-1: ComfyUI's default is tiling=True (see comfy/ldm/minimax/vae.py
-        # __init__). The spatial tile path linearly cross-fades ``tile_overlap_min``
-        # pixels between adjacent tiles, so the per-16-px per-patch grid is
-        # blended across a wider band once we cross a tile boundary. For
-        # frames <= tile_size we skip tiling and take the single-shot path.
-        tiling: bool = True,
+        tiling: bool = False,
         # Phase 8.8: deblock defaulted OFF. It was a post-decode 16-px
         # boundary low-pass (alpha=0.35, bw=3) added in Phase 8.7 to mask a
         # crosshatch texture from the ViT3D decoder. In practice it touches
@@ -767,163 +762,6 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     def _decode_pixels_ndhwc(self, z_ndhwc: mx.array) -> mx.array:
         return self.decoder(self.post_quant_conv(z_ndhwc))
-
-    def _adaptive_encode_ndhwc(self, x_ndhwc: mx.array) -> mx.array:
-        if self.tiling and (
-            x_ndhwc.shape[2] > self.tile_size or x_ndhwc.shape[3] > self.tile_size
-        ):
-            return self.tiled_encode_ndhwc(x_ndhwc)
-        return self._encode_moments_ndhwc(x_ndhwc)
-
-    def _adaptive_decode_ndhwc(self, z_ndhwc: mx.array) -> mx.array:
-        if self.tiling and (
-            z_ndhwc.shape[2] * self.vae_ratio > self.tile_size
-            or z_ndhwc.shape[3] * self.vae_ratio > self.tile_size
-        ):
-            return self.tiled_decode_ndhwc(z_ndhwc)
-        return self._decode_pixels_ndhwc(z_ndhwc)
-
-    # ------------------------------------------------------------------
-    # Phase 8.11-1: spatial tiling.
-    # Ported from ComfyUI comfy/ldm/minimax/vae.py:400-518. Splits the
-    # (B, T, H, W, C) tensor into overlapping tiles along the H and W
-    # axes (axis=2 and axis=3 in NDHWC), encodes/decodes each tile
-    # separately, then linearly cross-fades the overlap regions.
-    #
-    # Overlap size is a multiple of ``vae_ratio`` so latent-space and
-    # pixel-space grids stay aligned. Tile size is the pixel-space
-    # length (encoder input / decoder output resolution).
-    # ------------------------------------------------------------------
-    def _split_tiles(self, input_len: int):
-        tile_size = self.tile_size
-        if tile_size >= input_len:
-            return [0], [input_len], []
-
-        N = int(math.ceil(input_len / tile_size))
-        while True:
-            overlaps = [self.tile_overlap_min] * (N - 1)
-            remaining = tile_size * N - sum(overlaps) - input_len
-            if remaining < 0:
-                N += 1
-            else:
-                break
-
-        # distribute leftover overlap in multiples of vae_ratio
-        remaining_units = remaining // self.vae_ratio
-        for i in range(remaining_units):
-            overlaps[i % (N - 1)] += self.vae_ratio
-
-        tile_start_idx = [0]
-        for i in range(N - 1):
-            tile_start_idx.append(tile_start_idx[-1] + tile_size - overlaps[i])
-        return tile_start_idx, [tile_size] * N, overlaps
-
-    @staticmethod
-    def _blend_axis(a: "mx.array", b: "mx.array", blend_extent: int, axis: int) -> "mx.array":
-        """Linear cross-fade of ``a``'s tail into ``b``'s head along ``axis``."""
-        blend_extent = int(min(a.shape[axis], b.shape[axis], blend_extent))
-        if blend_extent <= 0:
-            return b
-        pos = mx.arange(blend_extent, dtype=b.dtype)
-        shape = [1] * b.ndim
-        shape[axis] = blend_extent
-        w_b = (pos / blend_extent).reshape(tuple(shape))
-        w_a = 1.0 - w_b
-
-        # slice a's tail and b's head
-        a_slices = [slice(None)] * a.ndim
-        a_slices[axis] = slice(-blend_extent, None)
-        b_slices = [slice(None)] * b.ndim
-        b_slices[axis] = slice(0, blend_extent)
-        a_tail = a[tuple(a_slices)]
-        b_head = b[tuple(b_slices)]
-        blended = a_tail * w_a + b_head * w_b
-
-        if blend_extent < b.shape[axis]:
-            b_rest_slices = [slice(None)] * b.ndim
-            b_rest_slices[axis] = slice(blend_extent, None)
-            return mx.concatenate([blended, b[tuple(b_rest_slices)]], axis=axis)
-        return blended
-
-    def tiled_encode_ndhwc(self, x_ndhwc: mx.array) -> mx.array:
-        """Overlapping spatial-tiled encode.
-
-        ``x_ndhwc`` shape (B, T, H, W, C_in). Output shape
-        (B, T_lat, H_lat, W_lat, 2*z_channels).
-        """
-        H, W = int(x_ndhwc.shape[2]), int(x_ndhwc.shape[3])
-        y_idx, y_len, y_overlap = self._split_tiles(H)
-        x_idx, x_len, x_overlap = self._split_tiles(W)
-
-        # encode each tile
-        rows: list[list[mx.array]] = []
-        for i_pos, i_len in zip(y_idx, y_len):
-            row: list[mx.array] = []
-            for j_pos, j_len in zip(x_idx, x_len):
-                tile = x_ndhwc[:, :, i_pos:i_pos + i_len, j_pos:j_pos + j_len, :]
-                row.append(self._encode_moments_ndhwc(tile))
-            rows.append(row)
-
-        # latent-space overlap (in tokens)
-        lat_y_overlap = [o // self.vae_ratio for o in y_overlap]
-        lat_x_overlap = [o // self.vae_ratio for o in x_overlap]
-
-        result_rows: list[mx.array] = []
-        for i, row in enumerate(rows):
-            result_row: list[mx.array] = []
-            for j, tile in enumerate(row):
-                if i > 0:
-                    tile = self._blend_axis(rows[i - 1][j], tile, lat_y_overlap[i - 1], axis=2)
-                if j > 0:
-                    tile = self._blend_axis(row[j - 1], tile, lat_x_overlap[j - 1], axis=3)
-                if i < len(rows) - 1:
-                    tile = tile[:, :, : -lat_y_overlap[i], :, :]
-                if j < len(row) - 1:
-                    tile = tile[:, :, :, : -lat_x_overlap[j], :]
-                result_row.append(tile)
-            result_rows.append(mx.concatenate(result_row, axis=3))
-        return mx.concatenate(result_rows, axis=2)
-
-    def tiled_decode_ndhwc(self, z_ndhwc: mx.array) -> mx.array:
-        """Overlapping spatial-tiled decode.
-
-        ``z_ndhwc`` shape (B, T_lat, H_lat, W_lat, C_z). Output shape
-        (B, T_out, H_out, W_out, C_out).
-        """
-        H_pixels = int(z_ndhwc.shape[2]) * self.vae_ratio
-        W_pixels = int(z_ndhwc.shape[3]) * self.vae_ratio
-        y_idx, y_len, y_overlap = self._split_tiles(H_pixels)
-        x_idx, x_len, x_overlap = self._split_tiles(W_pixels)
-
-        # decode each tile in row-major
-        rows: list[list[mx.array]] = []
-        for i_pos, i_len in zip(y_idx, y_len):
-            zi = i_pos // self.vae_ratio
-            zl = i_len // self.vae_ratio
-            row: list[mx.array] = []
-            for j_pos, j_len in zip(x_idx, x_len):
-                zj = j_pos // self.vae_ratio
-                zw = j_len // self.vae_ratio
-                tile_z = z_ndhwc[:, :, zi:zi + zl, zj:zj + zw, :]
-                row.append(self._decode_pixels_ndhwc(tile_z))
-            rows.append(row)
-
-        # blend + trim in pixel space (blend_extent = pixel overlap)
-        result_rows: list[mx.array] = []
-        for i, row in enumerate(rows):
-            result_row: list[mx.array] = []
-            for j, tile in enumerate(row):
-                if i > 0:
-                    tile = self._blend_axis(rows[i - 1][j], tile, y_overlap[i - 1], axis=2)
-                if j > 0:
-                    tile = self._blend_axis(row[j - 1], tile, x_overlap[j - 1], axis=3)
-                if i < len(rows) - 1:
-                    tile = tile[:, :, : -y_overlap[i], :, :]
-                if j < len(row) - 1:
-                    tile = tile[:, :, :, : -x_overlap[j], :]
-                result_row.append(tile)
-            result_rows.append(mx.concatenate(result_row, axis=3))
-        return mx.concatenate(result_rows, axis=2)
 
     # ------------------------------------------------------------------
     # Phase 8.9-a: temporal chunk decode with overlap + cross-fade.
@@ -1023,7 +861,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
             clip_z = z[:, t_start_idx:t_end_idx, :, :, :]
 
-            clip_dec = self._adaptive_decode_ndhwc(clip_z)
+            clip_dec = self._decode_pixels_ndhwc(clip_z)
             if first_dtype is None:
                 first_dtype = clip_dec.dtype
                 first_shape_tail = clip_dec.shape[2:]
@@ -1079,7 +917,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         x = (x - self.pixel_mean.astype(x.dtype)) / self.pixel_std.astype(x.dtype)
 
         if x.shape[1] == 1:
-            moments = self._adaptive_encode_ndhwc(x)
+            moments = self._encode_moments_ndhwc(x)
             moments = moments[:, -1:, :, :, :]
         else:
             # Simple temporal-chunked path: split into non-overlapping clips.
@@ -1094,7 +932,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             outs = []
             for i in range(num_chunks):
                 clip = x[:, i * self.clip_length:(i + 1) * self.clip_length]
-                outs.append(self._adaptive_encode_ndhwc(clip))
+                outs.append(self._encode_moments_ndhwc(clip))
             moments = mx.concatenate(outs, axis=1)
             if self.token_drop > 0:
                 moments = moments[:, :-self.token_drop]
@@ -1178,7 +1016,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         z = z * latents_std + latents_mean
 
         if z.shape[1] == 1:
-            dec = self._adaptive_decode_ndhwc(z)
+            dec = self._decode_pixels_ndhwc(z)
             dec = dec[:, -1:, :, :, :]
         else:
             # Phase 8.9-a: proper temporal chunk decode with overlap +

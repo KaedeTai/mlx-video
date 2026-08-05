@@ -111,11 +111,6 @@ class H3Pipeline:
         ref_image_latent: Optional[mx.array] = None,
         ref_audio_latent: Optional[mx.array] = None,
         verbose: bool = True,
-        # Phase 8.11-3 diagnostic: dump the DiT-produced latent (post-denoise,
-        # pre-VAE-decode) to this path as an npy file. Use with the
-        # scripts/h3/analyze_dit_latent.py FFT tool to check whether the
-        # 16-px spatial grid is already present upstream of the VAE.
-        dump_latent_path: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """End-to-end t2va (with optional ref image / ref audio).
 
@@ -192,16 +187,6 @@ class H3Pipeline:
                 sigma = float(self.scheduler.sigmas[i])
                 print(f"[H3] step {i+1}/{num_steps}: sigma={sigma:.4f}, "
                       f"step={_time.time()-step_t0:.1f}s")
-
-        # ------- 5.5) Optional: dump DiT-produced latent for FFT diagnostics -------
-        if dump_latent_path is not None:
-            from pathlib import Path as _Path
-            _p = _Path(dump_latent_path).expanduser()
-            _p.parent.mkdir(parents=True, exist_ok=True)
-            lat_np = np.asarray(video_latent.astype(mx.float32))
-            np.save(str(_p), lat_np)
-            if verbose:
-                print(f"[H3] dumped DiT latent to {_p}  (shape={lat_np.shape})")
 
         # ------- 6) Decode video + audio via VAEs -------
         if verbose:

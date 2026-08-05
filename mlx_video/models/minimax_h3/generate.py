@@ -81,10 +81,6 @@ def main():
                    help="Denoising sampler (default: euler)")
     p.add_argument("--shift-video", type=float, default=None,
                    help="Override scheduler.shift_video (default 12.0)")
-    p.add_argument("--dump-latent", default=None,
-                   help="Phase 8.11-3 diagnostic: save the DiT-produced latent to this .npy path")
-    p.add_argument("--no-tiling", action="store_true",
-                   help="Disable spatial tiling in the VAE (fall back to single-shot decode)")
     args = p.parse_args()
 
     from .pipeline import load_pipeline
@@ -102,9 +98,6 @@ def main():
         pipe.scheduler.shift_video = float(args.shift_video)
     print(f"[generate] pipeline loaded (sampler={pipe.scheduler.sampler}, "
           f"shift_video={pipe.scheduler.shift_video})")
-    if args.no_tiling:
-        pipe.video_vae.tiling = False
-        print("[generate] spatial tiling disabled")
 
     ref_image_latent = None
     if args.ref_image:
@@ -162,7 +155,6 @@ def main():
         ref_image_latent=ref_image_latent,
         ref_audio_latent=ref_audio_latent,
         verbose=True,
-        dump_latent_path=args.dump_latent,
     )
 
     print(f"[generate] done: {info}")

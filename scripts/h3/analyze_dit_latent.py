@@ -83,11 +83,13 @@ def latent_fft_report(latent_ncdhw: np.ndarray) -> None:
         # latent-space cycles-per-image at pixel period p_px
         k_col_cycles = (W_lat * 16.0) / p_px
         k_row_cycles = (H_lat * 16.0) / p_px
-        if k_col_cycles > W_lat // 2 or k_row_cycles > H_lat // 2:
-            # would alias below Nyquist -- skip
+        if k_col_cycles >= W_lat // 2 or k_row_cycles >= H_lat // 2:
+            # at/beyond Nyquist -- skip (col_idx would be out of range)
             continue
         col_idx = int(round(Wc + k_col_cycles))
         row_idx = int(round(Hc + k_row_cycles))
+        col_idx = min(col_idx, len(col_spec) - 1)
+        row_idx = min(row_idx, len(row_spec) - 1)
         col_r = peak_ratio_1d(col_spec, col_idx)
         row_r = peak_ratio_1d(row_spec, row_idx)
         print(f"  {p_px:>10d} {col_idx:>10d} {col_r:>10.3f} "

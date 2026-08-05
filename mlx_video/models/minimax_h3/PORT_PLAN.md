@@ -677,16 +677,40 @@ after `bash scripts/h3/phase811_samples.sh` finishes.
   matches ref. Scale1/scale2 loaded from checkpoint; per-block |max|
   values 0.02..0.06 (block 22 is the largest at 0.061); range matches
   reference dump.
-- **G. DiT-latent grid.** Not yet run; use
-  `bash scripts/h3/phase811_samples.sh` and read the
-  `analyze_dit_latent.py` output. If latent col/row ratio at fx=1/16
-  is > 1.2, the bug is upstream (DiT or conditioning). Otherwise it is
-  confined to the ViT decoder's per-patch proj_out projection.
+- **G. DiT-latent grid.** **Ruled out.** Phase 8.11-5 latent FFT
+  measured on `~/tmp/h3_phase811_v3_latent.npy` (B=1, C=24, T=12,
+  H_lat=W_lat=24, value stats mean=0.07, std=1.09, |max|=3.93). Peak
+  ratios at all sampled pixel-space periods (48–192 px, above the
+  latent Nyquist for p_px=16 and p_px=32) are 0.85..1.03 — no periodic
+  peak in the DiT latent. Nyquist-edge-vs-mid-band ratio is 0.39
+  (<< 1), so the DiT is *not* producing high-frequency energy that
+  would alias to a 16-px pattern. The remaining grid must therefore
+  be introduced by the ViT decoder's per-patch `proj_out` projection.
 
-### What's still untested after this commit (v2 was blocked)
+### Phase 8.11-5 measured pixel-FFT results (post-tiling)
+
+| sample | col ratio @ 1/16 | row ratio @ 1/16 | 2D peak (1/16, 1/16) | mp4 size |
+|---|---|---|---|---|
+| Phase 8.9 baseline (no tiling) | 1.037 | 1.059 | **1.918** | 74 KB |
+| Phase 8.11 `--no-tiling` (repro) | 0.983 | 1.057 | **1.792** | 125 KB |
+| Phase 8.11 tiled (v1, default) | 1.046 | 0.976 | **1.366** | 74 KB |
+| Phase 8.11 tiled + latent dump (v3) | 1.046 | 0.976 | **1.366** | 74 KB |
+
+Spatial tiling drops the 2D peak at the grid frequency by ~24 %
+(1.79 → 1.37). Row ratio dropped below 1.0 (0.976), i.e. no measurable
+horizontal grid line. Column ratio at 1.046 is close to 1.0 (residual).
+This is the ComfyUI parity path — the 8.10 conclusion that tiling
+"can't matter because the stride is 128 px" was wrong: the overlap
+cross-fade smooths the per-patch discontinuity across the tile
+boundary and averages the phase of the ViT patch pattern, which is
+enough to knock out most of the peak.
+
+### What's still untested after Phase 8.11-5
 
 1. Real qwen3vl_32b_minimax_h3_bf16 text encoder + vision splicing —
-   requires a ~51 GB download + full Qwen3-VL vision-tower MLX port.
-2. Fresh sample generation with tiling enabled (this commit changed
-   the default). User to run `bash scripts/h3/phase811_samples.sh` and
-   report the ratios.
+   requires a ~51 GB download + full Qwen3-VL vision-tower MLX port
+   (Phase 9-1).
+2. Full elimination of the residual col=1.046 peak. Options: larger
+   `tile_overlap_min`, cosine-window blend instead of linear, or a
+   direct fix in the ViT decoder's `proj_out` (per-patch overlap-add).
+   Not started — 1.37 is a large improvement but still above 1.0.
