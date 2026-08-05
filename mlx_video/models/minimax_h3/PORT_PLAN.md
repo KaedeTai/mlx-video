@@ -468,7 +468,7 @@ ref-conditioning blocks across denoising steps. Both are Phase 9.
 - [x] Phase 8.7 VAE patch-boundary deblock (crosshatch artifact) -> commit 9bd31be1
 - [x] Phase 8.8 code-review vs ComfyUI: deblock off by default (root-cause fix), library num_steps 15->30 parity, LANCZOS ref resize
 - [x] Phase 8.9-a decode_temporal cross-fade port (fixes chunk-boundary neighbor-leak) -> commit 37a1cbbd
-- [ ] Phase 8.9-b text-encoder swap + vision splicing (deferred, see Phase 9-1)
+- [x] Phase 8.9-b real H3-specific text encoder + ref2va text prefixes (Chinese speech verified; commit pending)
 
 ### Phase 8.7 details
 
@@ -626,6 +626,92 @@ temporal boundary artifact — it affects img2v conditioning quality
 (reference-image content leakage into text hidden state), not the
 decode path. Move to Phase 9-1.
 
+### Phase 8.9-b resolution (2026-08-05, evening)
+
+Followup after user reported: "images + lip-sync fixed by 8.11 spatial
+tiling, but the audio is speech-*like sound* that isn't any language."
+
+**Root cause confirmed.** The old bridge
+(`text_encoder_bridge.TextEncoderBridge`, Phase 8-1) wrapped the stock
+`mlx-community/Qwen3-VL-32B-Instruct-4bit` — an AWQ Q4 checkpoint whose
+calibration targets output logits, not the mid-layer hidden state H3
+extracts at layer 50. Every denoise step fed the DiT a
+distributionally-shifted conditioning tensor, so it painted plausible
+speech-shaped audio content whose token stream corresponds to no
+language.
+
+**Fix landed.**
+
+1. Downloaded
+   `Comfy-Org/MiniMax-H3/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`
+   (51.5 GB, 902 tensors, `__metadata__ = {"num_hidden_layers": 50,
+   "output": "unnormalized_hidden_after_layer_50"}`) to
+   `~/models/H3-text-encoder-bf16/`.
+2. Wrote `scripts/h3/convert_h3_text_encoder.py` — streams the single-file
+   Comfy checkpoint into an mlx-vlm-compatible directory
+   (`~/mlx-video/mlx-models/H3-TextEncoder-MLX-bf16/`, 10 shards × 5 GB,
+   902 tensors, 25 s wall). Rekey rules:
+   - Comfy `model.embed_tokens.*`  → `model.language_model.embed_tokens.*`
+     → (mlx-vlm sanitize) → `language_model.model.embed_tokens.*`
+   - Comfy `model.layers.N.*`      → `model.language_model.layers.N.*`
+     → `language_model.model.layers.N.*`
+   - Comfy `visual.*`              → `model.visual.*`   → `vision_tower.*`
+   - `config.text_config.num_hidden_layers` patched **64 → 50**,
+     quantization block removed, `dtype = bfloat16`.
+3. Added `H3TextEncoderBridge` in `text_encoder_bridge.py`. Custom loader
+   inlines `mlx_vlm.utils.load_model` but passes `strict=False`
+   (Comfy ckpt omits `lm_head.weight` and `model.norm.weight` — H3 uses
+   the *unnormalized* layer-50 hidden and never runs the head or final
+   norm). After load: `del lang.lm_head`, `del lang.model.norm`,
+   `del model.vision_tower` (`load_vision=False` default — vision-token
+   splicing is Phase 8.9-c).
+4. `format_ref2va_prompt(prompt, has_ref_image, has_ref_audio)` prepends
+   the ref2va text markers `"<Picture 1>: "` and `"<Audio 1>: "` per
+   `comfy/text_encoders/minimax.py`. Audio never enters Qwen — the text
+   prefix alone matches the training presentation.
+5. Added `context: Optional[mx.array] = None` to `H3Pipeline.generate`
+   for **RAM plan B**: the 51 GB encoder and the 30-60 GB DiT+VAE stack
+   can't coexist in 128 GB, so the CLI does
+   *encode → free encoder → load DiT+VAEs → generate(context=…)*.
+6. New CLI `scripts/h3/sample_phase89b.py` runs plan B end-to-end.
+
+**Verification.**
+
+- Sample: `~/tmp/h3_phase89b_v1_sample.mp4`, 384 × 576, 33 → 39 frames,
+  30 steps, seed 0, ref image `~/tmp/wang_0100.jpg`.
+- Prompt: `王博士溫暖地看著鏡頭說：大家好，我是王文欽博士`
+- Context tensor: `(1, 26, 5120)` fp32, norm 16 215, mean 0.165,
+  std 44.44 — the "<Picture 1>: " prefix adds the leading tokens.
+- Whisper (`turbo`, `--language Chinese`) transcript:
+  `大家好,我是王文青做事。`
+- Result: the opening `大家好，我是` matches verbatim; `王文青` is a
+  near-homophone of `王文欽` (Qing / Qin); `做事` (`zuòshì`) is a
+  classic whisper mishearing of `博士` (`bóshì`) at low bitrate.
+  This is real Chinese, not speech-like garbage — the fix works.
+
+**Timing / RAM.**
+
+- Encoder load (mmap) + eval: 1.7 s.
+- Encode 26 tokens: 0.25 s.
+- DiT + VAE load (lazy, first step warm-up counted): 2.7 s.
+- 30 denoise steps: 177 s wall (avg 5.9 s / step).
+- Peak RSS: 48.66 GB during stage 1 (encoder); 40.80 GB during stage 2
+  (DiT + VAEs after `mx.clear_cache()`). Below the 128 GB budget with
+  room for a 4-8 GB safety margin.
+
+**What's still deferred to Phase 8.9-c (was 8.11-2 part 2).**
+
+Vision-token splicing. Right now `H3TextEncoderBridge` skips the vision
+tower entirely (only the `<Picture 1>: ` **text prefix** is emitted).
+Full vision splicing needs the Qwen3-VL vision tower forward
+(`patch_embed → 27 vision blocks → deepstack merge → per-patch projection`)
+with the resulting tokens spliced between `<|vision_start|>` (151652)
+and `<|vision_end|>` (151653) in the id stream, plus the
+`minimax_token_tags` fp32 array (tag 0 for vision positions, 1 for
+text) forwarded to the DiT's adaLN. Expected to improve
+prompt-image alignment (identity, pose, background match); does *not*
+gate whether the audio is a real language.
+
 ## 18. Phase 8.11 sequence (2026-08-05)
 
 - [x] Phase 8.11-1: port ComfyUI spatial `tiled_encode` / `tiled_decode`
@@ -641,7 +727,7 @@ decode path. Move to Phase 9-1.
   `scripts/h3/analyze_dit_latent.py` runs numpy 2D FFT on the latent
   and the decoded mp4, reporting peak ratios at fx=1/16-px band.
   Driver: `scripts/h3/phase811_samples.sh`.
-- [ ] Phase 8.11-2: real text encoder + vision splicing. Blocked by
+- [x] Phase 8.11-2 (part 1 of 2 — text encoder done in 8.9-b): the real qwen3vl_32b_minimax_h3_bf16 encoder is now wired in. Vision-token splicing (part 2) still deferred. Was blocked by
   ~51 GB download and full Qwen3-VL vision-tower MLX port (see 8.9-b
   block above). Scaffolding remains at `text_encoder_bridge.py`
   (`load_vision=False`).

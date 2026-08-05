@@ -116,6 +116,12 @@ class H3Pipeline:
         # scripts/h3/analyze_dit_latent.py FFT tool to check whether the
         # 16-px spatial grid is already present upstream of the VAE.
         dump_latent_path: Optional[str] = None,
+        # Phase 8.9-b: pre-computed text conditioning. If provided, the
+        # attached ``text_encoder`` is NOT called — this lets the caller run
+        # ``H3TextEncoderBridge.encode(...)`` in a separate stage, free the
+        # 51 GB encoder, then load the DiT (RAM plan B, since encoder + DiT
+        # together exceed the 128 GB budget on this machine).
+        context: Optional[mx.array] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """End-to-end t2va (with optional ref image / ref audio).
 
@@ -139,7 +145,12 @@ class H3Pipeline:
         audio_latent = mx.array(rng.standard_normal((1, 32, 2, audio_t)).astype(np.float32))
 
         # ------- 2) Text embeddings (fp32) -------
-        context = self.text_encoder.encode(prompt).astype(mx.float32)
+        # Phase 8.9-b: allow a pre-computed context to bypass the attached
+        # encoder (see RAM plan B in the ``context`` docstring above).
+        if context is None:
+            context = self.text_encoder.encode(prompt).astype(mx.float32)
+        else:
+            context = context.astype(mx.float32)
         text_len = context.shape[1]
 
         # ------- 3) Set up scheduler + noise scale -------
