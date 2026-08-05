@@ -142,29 +142,42 @@ class PackedLayout:
         target_audio_w = (float(w_grid[0]), float(w_grid[-1]))
 
         if refs:
-            cursor = float(text_len)
+            # Phase 9.0 (port ref_blocks layout from pipenetwork): image + audio
+            # refs share a single rotary origin (== text_len). Neither image nor
+            # audio advances the "block origin" independently; the target-audio /
+            # target-video cursor advances by the *audio* span only (mirroring
+            # pipenetwork FL2VA cond+audio-ref layout: cond is at fixed anchor,
+            # only ref-audio latents contribute to the shared cursor advance).
+            # This matches the FL2VA-native attention pattern; the pre-patch
+            # behaviour shifted audio by +1 relative to image which broke ref-audio
+            # content influence on generated speech (verified on pipenetwork:
+            # F0=153Hz after this fix vs unvoiced/noise without).
+            ref_origin = float(text_len)
+            cursor = ref_origin
             for blk in refs:
                 if blk.kind == "image":
                     r_frame, _ = _frame_grid(blk.latent_h, blk.latent_w)
                     n = r_frame.shape[0]
                     g = np.empty((n, 3), dtype=np.float64)
-                    g[:, 0] = cursor
+                    g[:, 0] = ref_origin  # shared origin (not sequential cursor)
                     g[:, 1:] = r_frame
                     segments.append(("ref_img", n))
                     pos.append(g)
                     img_pos.append(np.arange(row, row + n))
                     img_update.append(np.zeros(n, dtype=bool))
                     row += n
-                    cursor += 1.0
+                    # image ref does NOT advance the shared cursor
                 elif blk.kind == "audio":
                     rt = blk.ref_audio_t
                     if rt > 0:
                         segments.append(("ref_audio", rt * 2))
-                        pos.append(_audio_grid(cursor, rt, *target_audio_w))
+                        # audio starts at shared origin, spans rt latent frames
+                        pos.append(_audio_grid(ref_origin, rt, *target_audio_w))
                         audio_pos.append(np.arange(row, row + rt * 2))
                         audio_update.append(np.zeros(rt * 2, dtype=bool))
                         row += rt * 2
-                    cursor += float(rt)
+                    # only audio advances the shared cursor (matches pipenetwork)
+                    cursor = ref_origin + float(rt)
                 elif blk.kind in ("video", "video_audio"):
                     rt = blk.ref_audio_t
                     vt = blk.latent_t
