@@ -97,6 +97,10 @@ def main():
                     help="Path to Turbo LoRA safetensors for 4-step sampling (runtime overlay)")
     ap.add_argument("--turbo-lora-alpha", default=1.0, type=float,
                     help="LoRA scale factor (default 1.0)")
+    ap.add_argument("--adaln-cache", action="store_true",
+                    help="v15: precompute per-block AdaLN modulation from bf16 adaln_proj, "
+                         "then drop those weights. Cuts DiT resident ~24 GB with no voice-quality "
+                         "loss (cache built from bf16, not Q4).")
     ap.add_argument("--layer-group-size", type=int, default=0,
                     help="If >0, enable LayerGroupManager on the DiT blocks. "
                          "Weights of dormant groups live in CPU RAM (not Metal-wired), "
@@ -176,6 +180,24 @@ def main():
                                      alpha=args.turbo_lora_alpha, verbose=True)
         _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, "
              f"peak_rss={_peak_rss_gb():.2f} GB")
+
+    # v15: AdaLN cache before LayerGroupManager so eviction snapshot excludes dropped adaln.
+    if args.adaln_cache:
+        _log("v15: building AdaLN modulation cache and dropping adaln_proj weights")
+        t_c = time.time()
+        import mlx.core as _mx_c
+        active_before = _mx_c.get_active_memory() / 1024**3
+        cache = pipe.build_adaln_cache_and_drop(
+            num_steps=args.num_steps,
+            has_visual_cond=(ref_image_path is not None or ref_video_path is not None),
+            has_audio_cond=(ref_audio_path is not None),
+            verbose=True,
+        )
+        active_after = _mx_c.get_active_memory() / 1024**3
+        _log(f"adaln cache: {cache.num_timesteps} timesteps, "
+             f"{cache.nbytes()/1e6:.1f} MB lookup table")
+        _log(f"active_mlx {active_before:.2f} GB -> {active_after:.2f} GB "
+             f"in {time.time()-t_c:.1f}s, peak_rss={_peak_rss_gb():.2f} GB")
 
     if args.layer_group_size > 0:
         _log(f"enabling LayerGroupManager (group_size={args.layer_group_size})")

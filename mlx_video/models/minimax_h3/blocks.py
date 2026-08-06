@@ -201,8 +201,15 @@ class DiTBlock(nn.Module):
         t_emb: mx.array,
         mod_segments: Sequence[Tuple[int, int, int]],
         rope_table: mx.array,
+        modulation: "Tuple[mx.array, ...] | None" = None,
     ) -> mx.array:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+        # ``modulation`` overrides ``adaln_proj(t_emb)``: 6-tuple of ``[M*3, hidden]`` tensors
+        # supplied by :class:`ModulationCache`. When provided, the AdaLN linear projection is
+        # never invoked, which is what lets its weights be dropped at inference time.
+        if modulation is not None:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
         x = _mod_gate(x, gate_msa, self.attn(h, rope_table=rope_table), mod_segments)
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
@@ -236,8 +243,14 @@ class FinalLayer(nn.Module):
         t_emb: mx.array,
         video_seg: Tuple[int, int, int],
         audio_seg: Tuple[int, int, int],
+        modulation: "Tuple[mx.array, mx.array] | None" = None,
     ) -> Tuple[mx.array, mx.array]:
-        shift, scale = self.adaln_proj(t_emb)
+        # ``modulation`` overrides ``adaln_proj(t_emb)``: 2-tuple ``(shift, scale)`` of
+        # ``[M, hidden]`` tensors from :class:`ModulationCache`.
+        if modulation is not None:
+            shift, scale = modulation
+        else:
+            shift, scale = self.adaln_proj(t_emb)
         va, vb, vrow = video_seg
         aa, ab, arow = audio_seg
         v_scale = 1.0 + scale[vrow:vrow + 1]

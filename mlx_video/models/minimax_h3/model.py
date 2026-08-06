@@ -357,25 +357,42 @@ class MiniMaxH3Model(nn.Module):
         inv_freq_np = np.asarray(self.rope.inv_freq).astype(np.float32)
         rope_table = build_rope_table(layout.position_ids, inv_freq_np, dtype=compute_dtype)
 
+        # ---- ModulationCache lookup (optional; v15) ----
+        # When a cache is attached the per-block ``adaln_proj`` weights have been dropped;
+        # per-step modulation is gathered from the precomputed union-of-timesteps table.
+        cache = getattr(self, "_modulation_cache", None)
+        if cache is not None:
+            # Pre-materialize per-block modulation tuples so we don't re-gather inside a
+            # ``LayerGroupManager.active_group`` context (which is orthogonal to the cache).
+            per_block_mod = [cache.gather(i, unique_t) for i in range(len(self.blocks))]
+            mx.eval(*[a for tup in per_block_mod for a in tup])
+        else:
+            per_block_mod = [None] * len(self.blocks)
+
         # ---- 50 DiT blocks (optionally group-evicted) ----
         mgr = getattr(self, "_layer_mgr", None)
         if mgr is not None:
             for gi in range(mgr.num_groups):
                 with mgr.active_group(gi) as blocks:
-                    for block in blocks:
-                        h = block(h, t_emb, mod_segments, rope_table)
+                    s_g, e_g = mgr.group_ranges[gi]
+                    for local_bi, block in enumerate(blocks):
+                        bi = s_g + local_bi
+                        h = block(h, t_emb, mod_segments, rope_table,
+                                  modulation=per_block_mod[bi])
                     # Force the block-group's computation to finish before we
                     # evict its weights. Without this, MLX's lazy graph would
                     # still reference the arrays we're about to swap out.
                     mx.eval(h)
         else:
-            for block in self.blocks:
-                h = block(h, t_emb, mod_segments, rope_table)
+            for i, block in enumerate(self.blocks):
+                h = block(h, t_emb, mod_segments, rope_table,
+                          modulation=per_block_mod[i])
 
         # ---- Final layer: split video / audio slices ----
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
-        v_out, a_out = self.final_layer(h, t_emb, video_seg, audio_seg)
+        final_mod = cache.final_layer_gather(unique_t) if (cache is not None and cache.final_table is not None) else None
+        v_out, a_out = self.final_layer(h, t_emb, video_seg, audio_seg, modulation=final_mod)
 
         # ---- Unpatchify + trim to orig ----
         video_out = unpatchify_video(v_out, latent_t, lat_h // 2, lat_w // 2,

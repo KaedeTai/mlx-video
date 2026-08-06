@@ -90,6 +90,52 @@ class H3Pipeline:
     text_encoder: Any  # anything with .encode(prompt) -> [1, L, 5120] mx.array
     scheduler: MiniMaxH3Scheduler = field(default_factory=MiniMaxH3Scheduler)
 
+    def build_adaln_cache_and_drop(
+        self,
+        num_steps: int,
+        *,
+        has_visual_cond: bool,
+        has_audio_cond: bool,
+        verbose: bool = True,
+    ):
+        """Precompute per-block AdaLN modulation, then drop the ``adaln_proj`` weights.
+
+        Rationale + design in ``modulation_cache.py``. Must be called AFTER any Turbo LoRA
+        overlay (LoRA does not touch ``adaln_proj`` in this build, so this is only about
+        the ordering of memory events) and BEFORE ``enable_layer_group_eviction`` so the
+        eviction snapshot never captures the dropped adaln parameters.
+        """
+        import time as _time
+        from .modulation_cache import (
+            ModulationCache, drop_adaln_weights, schedule_timesteps_with_keys,
+        )
+        # Populate scheduler.sigmas so we know the union of unique-t values.
+        self.scheduler.set_timesteps(num_steps)
+        keys, timesteps = schedule_timesteps_with_keys(
+            self.scheduler.sigmas.tolist(),
+            has_visual_cond=has_visual_cond,
+            has_audio_cond=has_audio_cond,
+            shift_video=self.scheduler.shift_video,
+            shift_audio=self.scheduler.shift_audio,
+        )
+        if verbose:
+            print(f"[adaln-cache] building for {timesteps.shape[0]} unique timesteps "
+                  f"(visual_cond={has_visual_cond}, audio_cond={has_audio_cond})...")
+        t0 = _time.time()
+        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.bfloat16, key_values=keys)
+        # Attach BEFORE dropping so a botched drop still leaves an intact model behind a cache.
+        self.dit._modulation_cache = cache
+        build_s = _time.time() - t0
+        if verbose:
+            print(f"[adaln-cache] built in {build_s:.1f}s, size {cache.nbytes()/1e6:.1f} MB")
+        t0 = _time.time()
+        freed = drop_adaln_weights(self.dit, drop_final=True)
+        drop_s = _time.time() - t0
+        if verbose:
+            print(f"[adaln-cache] dropped adaln_proj weights, freed {freed/1e9:.2f} GB "
+                  f"in {drop_s:.1f}s")
+        return cache
+
     def enable_layer_group_eviction(self, group_size: int = 10, verbose: bool = True):
         """Install a LayerGroupManager on ``self.dit``.
 
