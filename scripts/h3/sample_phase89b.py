@@ -302,8 +302,50 @@ def main():
         _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, {_mem_snapshot()}")
 
     # v15: AdaLN cache before LayerGroupManager so eviction snapshot excludes dropped adaln.
-    if args.adaln_cache:
-        _log("v15: building AdaLN modulation cache and dropping adaln_proj weights")
+    # v16 Sub2: auto-detect stripped bundle -- if <model_root>/dit/modulation_cache.npz
+    # exists we load the cache directly instead of rebuilding (and the adaln_proj weights
+    # were never in the model to begin with, so no drop is needed).
+    dit_dir = Path(args.model_root).expanduser() / "dit"
+    stripped_cache_npz = dit_dir / "modulation_cache.npz"
+    stripped_cache_sig = dit_dir / "cache_signature.json"
+    is_stripped_bundle = stripped_cache_npz.exists() and stripped_cache_sig.exists()
+
+    if args.adaln_cache and is_stripped_bundle:
+        _log(f"v16 Sub2: detected stripped bundle at {dit_dir} -- loading cache from disk")
+        t_c = time.time()
+        import mlx.core as _mx_c
+        active_before = _mx_c.get_active_memory() / 1024**3
+        from mlx_video.models.minimax_h3.modulation_cache import load_cache_bundle
+        cache = load_cache_bundle(stripped_cache_npz, stripped_cache_sig)
+        pipe.dit._modulation_cache = cache
+        # Fail-closed signature check for the loaded bundle vs. the run config.
+        sig = cache.signature
+        problems = []
+        if sig.num_steps != args.num_steps:
+            problems.append(f"num_steps: bundle={sig.num_steps} run={args.num_steps}")
+        has_vis = (ref_image_path is not None or ref_video_path is not None)
+        has_aud = (ref_audio_path is not None)
+        if sig.has_visual_cond != has_vis:
+            problems.append(f"has_visual_cond: bundle={sig.has_visual_cond} run={has_vis}")
+        if sig.has_audio_cond != has_aud:
+            problems.append(f"has_audio_cond: bundle={sig.has_audio_cond} run={has_aud}")
+        if sig.num_blocks != len(pipe.dit.blocks):
+            problems.append(f"num_blocks: bundle={sig.num_blocks} run={len(pipe.dit.blocks)}")
+        if problems:
+            raise SystemExit(
+                "[stripped-bundle] signature mismatch -- refusing to run: "
+                + "; ".join(problems)
+                + f"\nRebuild the bundle with matching options or point --model-root "
+                  f"at the full (non-stripped) bundle."
+            )
+        active_after = _mx_c.get_active_memory() / 1024**3
+        _log(f"stripped bundle cache loaded: {cache.num_steps} steps, "
+             f"{cache.nbytes()/1e6:.1f} MB lookup table, "
+             f"tag={sig.tag!r}, lora_hash={sig.lora_hash}")
+        _log(f"active_mlx {active_before:.2f} GiB -> {active_after:.2f} GiB "
+             f"in {time.time()-t_c:.1f}s, {_mem_snapshot()}")
+    elif args.adaln_cache:
+        _log("v16: building AdaLN modulation cache and dropping adaln_proj weights")
         t_c = time.time()
         import mlx.core as _mx_c
         active_before = _mx_c.get_active_memory() / 1024**3
@@ -314,7 +356,7 @@ def main():
             verbose=True,
         )
         active_after = _mx_c.get_active_memory() / 1024**3
-        _log(f"adaln cache: {cache.num_timesteps} timesteps, "
+        _log(f"adaln cache: {cache.num_steps} steps, "
              f"{cache.nbytes()/1e6:.1f} MB lookup table")
         _log(f"active_mlx {active_before:.2f} GiB -> {active_after:.2f} GiB "
              f"in {time.time()-t_c:.1f}s, {_mem_snapshot()}")

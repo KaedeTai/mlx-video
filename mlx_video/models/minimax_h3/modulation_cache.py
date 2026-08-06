@@ -698,6 +698,94 @@ def drop_adaln_weights(
     return freed
 
 
+# ---------------------------------------------------------------------------
+# Persistence: NPZ + JSON on-disk cache (Sub2 stripped bundle)
+# ---------------------------------------------------------------------------
+
+
+def _cache_arrays_to_flat(cache: "ModulationCache") -> Dict[str, mx.array]:
+    """Flatten the per-step tables into a single ``mx.savez``-friendly dict.
+
+    Layout:
+        step{s:04d}_block{b:03d}_t{t}    -> [M*3, hidden]   (block tables)
+        step{s:04d}_final_t{t}           -> [M, hidden]     (final layer, when present)
+        step{s:04d}_ut                    -> [M] float32     (unique_t list per step)
+
+    Also emits a control array 'meta_num_steps' / 'meta_num_blocks' so the
+    loader can size things without re-reading the JSON signature.
+    """
+    out: Dict[str, mx.array] = {}
+    for s_idx, step_blocks in enumerate(cache.per_step_tables):
+        for b_idx, tup in enumerate(step_blocks):
+            for t_idx, arr in enumerate(tup):
+                out[f"step{s_idx:04d}_block{b_idx:03d}_t{t_idx}"] = arr
+        out[f"step{s_idx:04d}_ut"] = mx.array(cache.per_step_ut[s_idx], dtype=mx.float32)
+    if cache.per_step_final is not None:
+        for s_idx, tup in enumerate(cache.per_step_final):
+            for t_idx, arr in enumerate(tup):
+                out[f"step{s_idx:04d}_final_t{t_idx}"] = arr
+    out["meta_num_steps"] = mx.array([cache.num_steps], dtype=mx.int32)
+    out["meta_num_blocks"] = mx.array([cache.num_blocks], dtype=mx.int32)
+    return out
+
+
+def save_cache_bundle(cache: "ModulationCache", npz_path: Any, signature_path: Any,
+                       *, block_tuple_len: int = 6, final_tuple_len: int = 2) -> None:
+    """Persist a :class:`ModulationCache` to ``npz_path`` + JSON ``signature_path``."""
+    from pathlib import Path as _P
+    npz_p = _P(npz_path).expanduser()
+    sig_p = _P(signature_path).expanduser()
+    npz_p.parent.mkdir(parents=True, exist_ok=True)
+    sig_p.parent.mkdir(parents=True, exist_ok=True)
+    flat = _cache_arrays_to_flat(cache)
+    # Also stamp the tuple lengths so the loader can rebuild the tuples.
+    flat["meta_block_tuple_len"] = mx.array([block_tuple_len], dtype=mx.int32)
+    flat["meta_final_tuple_len"] = mx.array(
+        [final_tuple_len if cache.per_step_final is not None else 0], dtype=mx.int32,
+    )
+    mx.savez(str(npz_p), **flat)
+    sig_p.write_text(json.dumps(cache.signature.to_dict(), indent=2))
+
+
+def load_cache_bundle(npz_path: Any, signature_path: Any) -> "ModulationCache":
+    """Inverse of :func:`save_cache_bundle`."""
+    from pathlib import Path as _P
+    npz_p = _P(npz_path).expanduser()
+    sig_p = _P(signature_path).expanduser()
+    if not npz_p.exists() or not sig_p.exists():
+        raise FileNotFoundError(f"missing bundle: {npz_p} or {sig_p}")
+    sig = CacheSignature.from_dict(json.loads(sig_p.read_text()))
+    data = mx.load(str(npz_p))
+    n_steps = int(data["meta_num_steps"].item())
+    n_blocks = int(data["meta_num_blocks"].item())
+    block_tuple_len = int(data["meta_block_tuple_len"].item())
+    final_tuple_len = int(data["meta_final_tuple_len"].item())
+
+    per_step_tables: List[List[Tuple[mx.array, ...]]] = []
+    per_step_ut: List[List[float]] = []
+    for s in range(n_steps):
+        block_outs: List[Tuple[mx.array, ...]] = []
+        for b in range(n_blocks):
+            tup = tuple(data[f"step{s:04d}_block{b:03d}_t{t}"] for t in range(block_tuple_len))
+            block_outs.append(tup)
+        per_step_tables.append(block_outs)
+        per_step_ut.append([float(x) for x in data[f"step{s:04d}_ut"].tolist()])
+
+    per_step_final: Optional[List[Tuple[mx.array, ...]]] = None
+    if final_tuple_len > 0:
+        per_step_final = []
+        for s in range(n_steps):
+            tup = tuple(data[f"step{s:04d}_final_t{t}"] for t in range(final_tuple_len))
+            per_step_final.append(tup)
+
+    return ModulationCache(
+        per_step_tables=per_step_tables,
+        per_step_ut=per_step_ut,
+        per_step_final=per_step_final,
+        signature=sig,
+    )
+
+
 __all__ = [
     "MODALITY_NUM",
     "VISUAL_COND_TIMESTEP",
@@ -716,4 +804,6 @@ __all__ = [
     "hash_layout",
     "_live_signature_from_pipeline",
     "_hash_per_step_ut",
+    "save_cache_bundle",
+    "load_cache_bundle",
 ]

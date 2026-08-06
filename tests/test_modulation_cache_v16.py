@@ -247,6 +247,38 @@ def test_signature_serialisation_roundtrip():
     assert ok, bad
 
 
+def test_cache_bundle_save_load_roundtrip(tmp_path):
+    """save_cache_bundle -> load_cache_bundle must round-trip a cache bitwise."""
+    from mlx_video.models.minimax_h3.modulation_cache import (
+        load_cache_bundle, save_cache_bundle,
+    )
+    dit = _FakeDit()
+    sigmas_list, sch = _make_sigmas(4)
+    sig, step_ut = _signature(
+        dit=dit, sigmas_list=sigmas_list, num_steps=4,
+        has_vis=True, has_aud=True, sch=sch,
+    )
+    cache = ModulationCache.build(dit, step_ut, sig)
+    npz = tmp_path / "cache.npz"
+    sig_p = tmp_path / "sig.json"
+    save_cache_bundle(cache, npz, sig_p)
+    assert npz.exists() and sig_p.exists()
+    loaded = load_cache_bundle(npz, sig_p)
+    assert loaded.num_steps == cache.num_steps
+    assert loaded.num_blocks == cache.num_blocks
+    ok, bad = cache.signature.matches(loaded.signature)
+    assert ok, bad
+    # Bitwise equality of every stored tensor.
+    for s in range(cache.num_steps):
+        for b in range(cache.num_blocks):
+            for a_orig, a_load in zip(cache.gather(b, s), loaded.gather(b, s)):
+                assert bool(mx.array_equal(a_orig, a_load).item())
+        for a_orig, a_load in zip(
+            cache.final_layer_gather(s), loaded.final_layer_gather(s),
+        ):
+            assert bool(mx.array_equal(a_orig, a_load).item())
+
+
 def test_hash_per_step_ut_stable():
     """Same input → same hash. Different input → different hash."""
     ut1 = [[0.1, 0.5], [0.2, 0.4]]
