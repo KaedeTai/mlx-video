@@ -108,10 +108,6 @@ class H3Pipeline:
         # (Phase 8.6) but the library API had drifted.
         num_steps: int = 30,
         seed: int = 0,
-        # Phase 8.9-c: raw HWC RGB image ([0,1] float32) for the text
-        # encoder's vision tower. Independent from ``ref_image_latent``
-        # which conditions the DiT ref block directly.
-        ref_image: Optional[np.ndarray] = None,
         ref_image_latent: Optional[mx.array] = None,
         ref_audio_latent: Optional[mx.array] = None,
         verbose: bool = True,
@@ -126,7 +122,6 @@ class H3Pipeline:
         # 51 GB encoder, then load the DiT (RAM plan B, since encoder + DiT
         # together exceed the 128 GB budget on this machine).
         context: Optional[mx.array] = None,
-        text_token_tags: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """End-to-end t2va (with optional ref image / ref audio).
 
@@ -150,34 +145,10 @@ class H3Pipeline:
         audio_latent = mx.array(rng.standard_normal((1, 32, 2, audio_t)).astype(np.float32))
 
         # ------- 2) Text embeddings (fp32) -------
-        # Phase 8.9-c: pass ref_image (raw HWC) to encoder so it can splice
-        # vision tokens between <|vision_start|>/<|vision_end|> and also
-        # collect ``minimax_token_tags`` for the DiT's per-modality adaLN.
-        # Phase 8.9-b compat: a pre-computed context bypasses the encoder.
-        # Phase 9-2: allow caller to inject text_token_tags when context is pre-computed
-        # (e.g. text-encoder run in a separate process to free VRAM before DiT load).
-        # Without tags the DiT falls back to modality tag 1 for every text row and loses
-        # the segment-level adaLN routing for <Picture>/<Audio>/prompt sub-runs.
+        # Phase 8.9-b: allow a pre-computed context to bypass the attached
+        # encoder (see RAM plan B in the ``context`` docstring above).
         if context is None:
-            text_token_tags = None
-            enc_kwargs = dict(
-                has_ref_image=(ref_image_latent is not None or ref_image is not None),
-                has_ref_audio=(ref_audio_latent is not None),
-            )
-            if ref_image is not None:
-                enc_kwargs["ref_image"] = ref_image
-            try:
-                encoded = self.text_encoder.encode(
-                    prompt, return_token_tags=True, **enc_kwargs,
-                )
-                context, text_token_tags = encoded
-            except TypeError:
-                # Legacy encoder without return_token_tags kwarg.
-                try:
-                    context = self.text_encoder.encode(prompt, **enc_kwargs)
-                except TypeError:
-                    context = self.text_encoder.encode(prompt)
-            context = context.astype(mx.float32)
+            context = self.text_encoder.encode(prompt).astype(mx.float32)
         else:
             context = context.astype(mx.float32)
         text_len = context.shape[1]
@@ -213,8 +184,6 @@ class H3Pipeline:
             refs=refs if refs else None,
         )
         payload["layout"] = layout
-        if text_token_tags is not None:
-            payload["text_token_tags"] = text_token_tags
         if verbose:
             print(f"[H3] packed seq_len={layout.seq_len}")
 

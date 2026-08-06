@@ -74,6 +74,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--ref-image", default=None)
+    ap.add_argument("--ref-video", default=None,
+                    help="Path to a reference video (mp4). Encoded via video_vae and used as kind='video' RefBlock.")
     ap.add_argument("--ref-audio", default=None)
     ap.add_argument("--width", type=int, default=384)
     ap.add_argument("--height", type=int, default=576)
@@ -81,7 +83,7 @@ def main():
     ap.add_argument("--num-steps", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--encoder-path",
-                    default="~/mlx-video/mlx-models/H3-TextEncoder-MLX-bf16")
+                    default="~/mlx-video/mlx-models/H3-TextEncoder-MLX-Q4")
     ap.add_argument("--model-root",
                     default="~/mlx-video/mlx-models/MiniMaxH3-Ref2VA-MLX-Q4")
     ap.add_argument("--output", required=True)
@@ -96,6 +98,7 @@ def main():
     _log(f"peak_rss(start)={_peak_rss_gb():.2f} GB")
 
     ref_image_path = Path(args.ref_image).expanduser() if args.ref_image else None
+    ref_video_path = Path(args.ref_video).expanduser() if args.ref_video else None
     ref_audio_path = Path(args.ref_audio).expanduser() if args.ref_audio else None
 
     # ---------- Stage 1: text encoder ----------
@@ -111,10 +114,12 @@ def main():
 
         _log(f"encoding prompt: {args.prompt!r}")
         _log(f"  has_ref_image={ref_image_path is not None}, "
+             f"has_ref_video={ref_video_path is not None}, "
              f"has_ref_audio={ref_audio_path is not None}")
         t0 = time.time()
         ctx = enc.encode(args.prompt,
                          has_ref_image=ref_image_path is not None,
+                         has_ref_video=ref_video_path is not None,
                          has_ref_audio=ref_audio_path is not None)
         mx.eval(ctx)
         _log(f"encode done in {time.time()-t0:.2f}s, "
@@ -170,31 +175,50 @@ def main():
         ref_image_latent = pipe.video_vae.encode(ref_x)
         _log(f"ref_image_latent shape: {ref_image_latent.shape}")
 
+    ref_video_latent = None
+    if ref_video_path:
+        import subprocess
+        # Decode video to raw rgb24 via ffmpeg
+        proc = subprocess.run(
+            ["ffprobe","-v","error","-select_streams","v:0",
+             "-show_entries","stream=width,height,nb_frames,r_frame_rate",
+             "-of","default=nw=1:nk=1", str(ref_video_path)],
+            capture_output=True, text=True, check=True)
+        pw, ph, nfr, rfr = proc.stdout.strip().split("\n")[:4]
+        pw, ph = int(pw), int(ph)
+        _log(f"ref_video probe: {pw}x{ph}, nb_frames={nfr}, fps={rfr}")
+        # Use ref video native res (multiple of 16 required by vae ratio),
+        # snap down to nearest 16 if needed.
+        rw = (pw // 16) * 16
+        rh = (ph // 16) * 16
+        raw = subprocess.run(
+            ["ffmpeg","-loglevel","error","-i",str(ref_video_path),
+             "-vf",f"scale={rw}:{rh},fps=24","-vframes","17",
+             "-pix_fmt","rgb24","-f","rawvideo","-"],
+            capture_output=True, check=True).stdout
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, rh, rw, 3)
+        _log(f"ref_video decoded frames={arr.shape[0]} at {rh}x{rw}")
+        # pad/truncate to multiple of clip_length (17 for h3)
+        T = 17
+        if arr.shape[0] < T:
+            arr = np.concatenate([arr, np.repeat(arr[-1:], T - arr.shape[0], axis=0)], axis=0)
+        else:
+            arr = arr[:T]
+        arr_f = arr.astype(np.float32) / 255.0
+        arr_f = arr_f * 2.0 - 1.0
+        # [T, H, W, 3] -> [1, 3, T, H, W]
+        arr_f = arr_f.transpose(3, 0, 1, 2)[None]
+        ref_v_x = mx.array(arr_f)
+        ref_video_latent = pipe.video_vae.encode(ref_v_x)
+        _log(f"ref_video_latent shape: {ref_video_latent.shape}")
+
     ref_audio_latent = None
     if ref_audio_path:
-        from scipy.signal import resample_poly
-        # soundfile handles wav+mp3+ogg+flac; falls back to wavfile if missing
-        try:
-            import soundfile as sf
-            wav, sr = sf.read(str(ref_audio_path), dtype='float32', always_2d=False)
-        except (ImportError, RuntimeError):
-            from scipy.io import wavfile
-            sr, wav = wavfile.read(ref_audio_path)
-        vae_sr = int(getattr(pipe.audio_vae, "sample_rate", 32000))
-        if wav.dtype == np.int16:
-            wav = wav.astype(np.float32) / 32768.0
-        elif wav.dtype == np.int32:
-            wav = wav.astype(np.float32) / 2147483648.0
-        else:
-            wav = wav.astype(np.float32)
-        if sr != vae_sr:
-            # Match ComfyUI comfy_extras/nodes_minimax_h3.py:_encode_ref_audio
-            from math import gcd
-            g = gcd(sr, vae_sr)
-            wav = resample_poly(wav, vae_sr // g, sr // g, axis=0)
-            _log(f"resampled ref audio {sr}Hz -> {vae_sr}Hz  (new samples={wav.shape[0]})")
+        from scipy.io import wavfile
+        sr, wav = wavfile.read(ref_audio_path)
         if wav.ndim == 1:
             wav = np.stack([wav, wav], axis=-1)
+        wav = wav.astype(np.float32) / 32768.0
         wav_mx = mx.array(wav.T[None, ...])
         ref_audio_latent = pipe.audio_vae.encode(wav_mx)
         _log(f"ref_audio_latent shape: {ref_audio_latent.shape}")
@@ -209,6 +233,7 @@ def main():
         width=args.width, height=args.height, length=args.length,
         num_steps=args.num_steps, seed=args.seed,
         ref_image_latent=ref_image_latent,
+        ref_video_latent=ref_video_latent,
         ref_audio_latent=ref_audio_latent,
         verbose=True,
         context=ctx_mx,
