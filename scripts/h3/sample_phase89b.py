@@ -215,6 +215,13 @@ def main():
                     help="If >0, enable LayerGroupManager on the DiT blocks. "
                          "Weights of dormant groups live in CPU RAM (not Metal-wired), "
                          "trading ~+30-40 ms/step for a lower peak Metal working set.")
+    ap.add_argument("--phase-evict", action="store_true",
+                    help="v16 Sub4 phase-aware residency: evict video_vae after refs "
+                         "have been encoded (before denoise) and reload it before "
+                         "decode. Also evicts the DiT before decode. Trades ~5-10 s "
+                         "of extra VAE reload wall time for a lower peak Metal-wired "
+                         "working set. Requires loading via load_pipeline() so the "
+                         "model_root is known.")
     ap.add_argument("--eval-every", type=int, default=10,
                     help="v16 Sub3 materialisation barrier: mx.eval(h) every N DiT "
                          "blocks in the forward loop. 0 disables. Default 10. Lets "
@@ -392,6 +399,13 @@ def main():
         wav_mx = mx.array(wav.T[None, ...])
         ref_audio_latent = pipe.audio_vae.encode(wav_mx)
         _log(f"ref_audio_latent shape: {ref_audio_latent.shape}")
+
+    # v16 260807 Sub4: turn on phase-evict AFTER refs are encoded so we don't
+    # trip the "video_vae was evicted" check inside pipe.video_vae.encode above.
+    if args.phase_evict:
+        _log("enabling phase-evict (video_vae will be dropped before denoise, "
+             "reloaded before decode; DiT dropped before decode)")
+        pipe.enable_phase_evict(evict_video_vae_for_denoise=True, verbose=True)
 
     # ---------- Stage 4: generate ----------
     _log(f"generating: {args.width}x{args.height}, {args.length} frames, "

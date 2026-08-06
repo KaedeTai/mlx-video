@@ -225,6 +225,94 @@ class H3Pipeline:
         self.dit._layer_mgr = mgr
         return mgr
 
+    # ------------------------------------------------------------------
+    # v16 260807 Sub4: phase-aware residency
+    # ------------------------------------------------------------------
+    #
+    # The pipeline has three natural phases whose peak Metal working sets do
+    # not overlap:
+    #
+    #   Phase 1 (ref encode) : video_vae + audio_vae resident, DiT dormant.
+    #   Phase 2 (denoise)    : DiT + (optional) LoRA + AdaLN cache resident,
+    #                          video_vae evicted. Audio VAE is tiny (~1.5 GB)
+    #                          so we keep it in place.
+    #   Phase 3 (decode)     : video_vae reloaded, DiT evicted (or at least
+    #                          modulation cache dropped and blocks freed).
+    #
+    # Default behaviour is unchanged: every component is loaded at load-time
+    # and stays resident. Opt in via ``enable_phase_evict()`` and the CLI's
+    # ``--phase-evict`` flag when running near the 128 GB budget.
+
+    def _evict_component(self, name: str, *, verbose: bool = True) -> None:
+        """Drop the named component (video_vae / audio_vae / dit) and force GC.
+
+        Uses ``del`` on the attribute followed by ``gc.collect`` and
+        ``mx.clear_cache`` so Metal-wired arenas actually release. Safe to
+        call twice; second call is a no-op.
+        """
+        import gc as _gc
+        obj = getattr(self, name, None)
+        if obj is None:
+            if verbose:
+                print(f"[phase-evict] {name}: already evicted")
+            return
+        setattr(self, name, None)
+        del obj
+        _gc.collect()
+        try:
+            mx.clear_cache()
+        except AttributeError:
+            pass
+        if verbose:
+            print(f"[phase-evict] evicted {name}")
+
+    def _reload_component(self, name: str, *, verbose: bool = True) -> None:
+        """Reload the named component from ``self._model_root`` (set by ``load_pipeline``).
+
+        Only ``video_vae`` and ``audio_vae`` are supported for reload -- the DiT
+        is far more expensive to warm and we don't currently need to reload it.
+        """
+        if getattr(self, name, None) is not None:
+            return
+        model_root = getattr(self, "_model_root", None)
+        if model_root is None:
+            raise RuntimeError(
+                f"[phase-evict] cannot reload {name}: pipeline has no _model_root; "
+                "phase-evict requires load via load_pipeline()"
+            )
+        if name == "video_vae":
+            from .video_vae import MiniMaxH3VideoVAE
+            v = MiniMaxH3VideoVAE()
+            v.load_weights(str(Path(model_root).expanduser() / "video_vae" / "model.safetensors"),
+                           strict=False)
+            self.video_vae = v
+        elif name == "audio_vae":
+            from .audio_vae import MiniMaxH3AudioVAE
+            a = MiniMaxH3AudioVAE()
+            a.load_weights(str(Path(model_root).expanduser() / "audio_vae" / "model.safetensors"),
+                           strict=False)
+            self.audio_vae = a
+        else:
+            raise RuntimeError(f"[phase-evict] reload of {name!r} not supported")
+        if verbose:
+            print(f"[phase-evict] reloaded {name}")
+
+    def enable_phase_evict(self, *, evict_video_vae_for_denoise: bool = True,
+                            verbose: bool = True) -> None:
+        """Turn on Sub4 phase-aware residency in ``generate()``.
+
+        Effect (opt-in only): after any ref VAEs have been encoded upstream of
+        ``generate()`` and after the ref-latents have been packed into
+        ``payload``, ``generate()`` will evict ``video_vae`` before the denoise
+        loop and reload it before decode. ``audio_vae`` stays resident (it's
+        small and needed at both ends).
+        """
+        self._phase_evict_enabled = True
+        self._phase_evict_video_vae = bool(evict_video_vae_for_denoise)
+        if verbose:
+            print(f"[phase-evict] enabled: "
+                  f"evict_video_vae_for_denoise={self._phase_evict_video_vae}")
+
     def _empty_av_latents(self, width: int, height: int, frame_count: int, dtype: mx.Dtype = mx.float32):
         _, latent_t, audio_t = temporal_shape(frame_count)
         video = mx.zeros((1, 24, latent_t, height // 16, width // 16), dtype=dtype)
@@ -352,6 +440,14 @@ class H3Pipeline:
                     + " -- call pipe.reset_adaln_cache() and rebuild for this run"
                 )
 
+        # v16 260807 Sub4 Phase 2: evict video_vae before denoise if opted-in.
+        # All ref latents were encoded upstream of generate() and now live inside
+        # ``cond_video_latents``; the DiT never needs the VAE weights.
+        _phase_evict = bool(getattr(self, "_phase_evict_enabled", False))
+        _evict_v_vae = _phase_evict and bool(getattr(self, "_phase_evict_video_vae", True))
+        if _evict_v_vae:
+            self._evict_component("video_vae", verbose=verbose)
+
         # ------- 5) Denoise loop -------
         for i in range(num_steps):
             step_t0 = _time.time()
@@ -381,6 +477,17 @@ class H3Pipeline:
             np.save(str(_p), lat_np)
             if verbose:
                 print(f"[H3] dumped DiT latent to {_p}  (shape={lat_np.shape})")
+
+        # v16 260807 Sub4 Phase 3: reload video_vae for decode + evict DiT + cache
+        # if we're in phase-evict mode. The DiT is no longer needed after the last
+        # denoise step; releasing it frees ~15-25 GiB of Metal-wired working set
+        # so the VAE decode has headroom for the temporal tile.
+        if _phase_evict:
+            # Drop DiT (and its ModulationCache) before reloading the video VAE
+            # so we don't briefly go through a peak with both resident.
+            self._evict_component("dit", verbose=verbose)
+        if _evict_v_vae:
+            self._reload_component("video_vae", verbose=verbose)
 
         # ------- 6) Decode video + audio via VAEs -------
         if verbose:
@@ -489,5 +596,8 @@ def load_pipeline(
             text_encoder = DummyTextEncoder()
 
     scheduler = MiniMaxH3Scheduler()
-    return H3Pipeline(dit=dit, video_vae=video_vae, audio_vae=audio_vae,
+    pipe = H3Pipeline(dit=dit, video_vae=video_vae, audio_vae=audio_vae,
                       text_encoder=text_encoder, scheduler=scheduler)
+    # v16 260807 Sub4: remember model_root so phase-evict can reload VAEs.
+    pipe._model_root = str(model_root)
+    return pipe
