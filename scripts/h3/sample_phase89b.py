@@ -97,6 +97,10 @@ def main():
                     help="Path to Turbo LoRA safetensors for 4-step sampling (runtime overlay)")
     ap.add_argument("--turbo-lora-alpha", default=1.0, type=float,
                     help="LoRA scale factor (default 1.0)")
+    ap.add_argument("--layer-group-size", type=int, default=0,
+                    help="If >0, enable LayerGroupManager on the DiT blocks. "
+                         "Weights of dormant groups live in CPU RAM (not Metal-wired), "
+                         "trading ~+30-40 ms/step for a lower peak Metal working set.")
     args = ap.parse_args()
 
     _log(f"peak_rss(start)={_peak_rss_gb():.2f} GB")
@@ -171,6 +175,19 @@ def main():
         n_wrapped = load_turbo_lora(pipe.dit, args.turbo_lora,
                                      alpha=args.turbo_lora_alpha, verbose=True)
         _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, "
+             f"peak_rss={_peak_rss_gb():.2f} GB")
+
+    if args.layer_group_size > 0:
+        _log(f"enabling LayerGroupManager (group_size={args.layer_group_size})")
+        t_g = time.time()
+        import mlx.core as mx
+        active_before = mx.get_active_memory() / 1024**3
+        mgr = pipe.enable_layer_group_eviction(group_size=args.layer_group_size,
+                                                verbose=True)
+        active_after = mx.get_active_memory() / 1024**3
+        _log(f"LayerGroupManager installed in {time.time()-t_g:.1f}s, "
+             f"active_mlx {active_before:.2f} GB -> {active_after:.2f} GB, "
+             f"dormant={mgr.stats()['dormant_gb']:.2f} GB, "
              f"peak_rss={_peak_rss_gb():.2f} GB")
 
     # ---------- Stage 3: refs (image + audio) ----------
@@ -252,6 +269,11 @@ def main():
         context=ctx_mx,
     )
     _log(f"generate done in {time.time()-t0:.1f}s, info={info}")
+    try:
+        _log(f"mlx peak={mx.get_peak_memory()/1024**3:.2f} GB, "
+             f"active={mx.get_active_memory()/1024**3:.2f} GB")
+    except Exception:
+        pass
 
     # ---------- Stage 5: mux ----------
     out_path = Path(args.output).expanduser()

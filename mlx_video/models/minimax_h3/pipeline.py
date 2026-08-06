@@ -90,6 +90,22 @@ class H3Pipeline:
     text_encoder: Any  # anything with .encode(prompt) -> [1, L, 5120] mx.array
     scheduler: MiniMaxH3Scheduler = field(default_factory=MiniMaxH3Scheduler)
 
+    def enable_layer_group_eviction(self, group_size: int = 10, verbose: bool = True):
+        """Install a LayerGroupManager on ``self.dit``.
+
+        Splits the 50 DiT blocks into groups of ``group_size`` and evicts
+        each group's weights to CPU-side numpy arrays. During forward,
+        one group is re-activated at a time; other groups are dormant so
+        their weights do not count against Metal's wired budget.
+
+        Call this AFTER any Turbo LoRA overlay has been installed so LoRA
+        A/B tensors are captured in the dormant state.
+        """
+        from .layer_group_evict import LayerGroupManager
+        mgr = LayerGroupManager(self.dit, group_size=group_size, verbose=verbose)
+        self.dit._layer_mgr = mgr
+        return mgr
+
     def _empty_av_latents(self, width: int, height: int, frame_count: int, dtype: mx.Dtype = mx.float32):
         _, latent_t, audio_t = temporal_shape(frame_count)
         video = mx.zeros((1, 24, latent_t, height // 16, width // 16), dtype=dtype)
@@ -109,6 +125,7 @@ class H3Pipeline:
         num_steps: int = 30,
         seed: int = 0,
         ref_image_latent: Optional[mx.array] = None,
+        ref_video_latent: Optional[mx.array] = None,
         ref_audio_latent: Optional[mx.array] = None,
         verbose: bool = True,
         # Phase 8.11-3 diagnostic: dump the DiT-produced latent (post-denoise,
@@ -168,6 +185,11 @@ class H3Pipeline:
             _, _, _, rh, rw = ref_image_latent.shape
             refs.append(RefBlock(kind="image", latent_h=rh, latent_w=rw))
             cond_video_latents.append(ref_image_latent)
+        if ref_video_latent is not None:
+            # ref_video_latent shape: [1, 24, vt, h, w]
+            _, _, vt, rh, rw = ref_video_latent.shape
+            refs.append(RefBlock(kind="video", latent_h=rh, latent_w=rw, latent_t=vt))
+            cond_video_latents.append(ref_video_latent)
         if ref_audio_latent is not None:
             # ref_audio_latent shape: [1, 32, 2, T]
             rat = ref_audio_latent.shape[-1]

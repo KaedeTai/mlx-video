@@ -357,9 +357,20 @@ class MiniMaxH3Model(nn.Module):
         inv_freq_np = np.asarray(self.rope.inv_freq).astype(np.float32)
         rope_table = build_rope_table(layout.position_ids, inv_freq_np, dtype=compute_dtype)
 
-        # ---- 50 DiT blocks ----
-        for block in self.blocks:
-            h = block(h, t_emb, mod_segments, rope_table)
+        # ---- 50 DiT blocks (optionally group-evicted) ----
+        mgr = getattr(self, "_layer_mgr", None)
+        if mgr is not None:
+            for gi in range(mgr.num_groups):
+                with mgr.active_group(gi) as blocks:
+                    for block in blocks:
+                        h = block(h, t_emb, mod_segments, rope_table)
+                    # Force the block-group's computation to finish before we
+                    # evict its weights. Without this, MLX's lazy graph would
+                    # still reference the arrays we're about to swap out.
+                    mx.eval(h)
+        else:
+            for block in self.blocks:
+                h = block(h, t_emb, mod_segments, rope_table)
 
         # ---- Final layer: split video / audio slices ----
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
