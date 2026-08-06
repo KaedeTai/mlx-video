@@ -331,9 +331,12 @@ class H3Pipeline:
         # (Phase 8.6) but the library API had drifted.
         num_steps: int = 30,
         seed: int = 0,
-        ref_image_latent: Optional[mx.array] = None,
-        ref_video_latent: Optional[mx.array] = None,
-        ref_audio_latent: Optional[mx.array] = None,
+        ref_image_latent: Optional[mx.array] = None,   # back-compat: single ref
+        ref_video_latent: Optional[mx.array] = None,   # back-compat: single ref
+        ref_audio_latent: Optional[mx.array] = None,   # back-compat: single ref
+        ref_image_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
+        ref_video_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
+        ref_audio_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
         verbose: bool = True,
         # Phase 8.11-3 diagnostic: dump the DiT-produced latent (post-denoise,
         # pre-VAE-decode) to this path as an npy file. Use with the
@@ -383,29 +386,58 @@ class H3Pipeline:
         audio_latent = self.scheduler.scale_noise(audio_latent)
 
         # ------- 4) Build ref blocks (optional, ref2va path) -------
+        # v17 multiref 260807: accept lists of ref latents. Comfy standard order:
+        #   images -> videos (each optionally paired with an audio track) ->
+        #   independent audios. Single-ref back-compat: ``ref_*_latent`` slots
+        #   feed into ``ref_*_latents`` list[0].
+        def _coerce_list(single, multi):
+            if multi is not None and len(multi) > 0:
+                if single is not None:
+                    # Both provided: put the singleton first (belt+braces).
+                    return [single] + list(multi)
+                return list(multi)
+            if single is not None:
+                return [single]
+            return []
+
+        img_latents_l = _coerce_list(ref_image_latent, ref_image_latents)
+        vid_latents_l = _coerce_list(ref_video_latent, ref_video_latents)
+        aud_latents_l = _coerce_list(ref_audio_latent, ref_audio_latents)
+
         refs: List[RefBlock] = []
         payload: Dict[str, Any] = {"seed": seed}
-        cond_video_latents = []
-        cond_audio_latents = []
-        if ref_image_latent is not None:
-            # ref_image_latent shape: [1, 24, 1, h, w]
-            _, _, _, rh, rw = ref_image_latent.shape
+        cond_video_latents: List[mx.array] = []
+        cond_audio_latents: List[mx.array] = []
+        # (a) images
+        for zi in img_latents_l:
+            # shape: [1, 24, 1, h, w]
+            _, _, _, rh, rw = zi.shape
             refs.append(RefBlock(kind="image", latent_h=rh, latent_w=rw))
-            cond_video_latents.append(ref_image_latent)
-        if ref_video_latent is not None:
-            # ref_video_latent shape: [1, 24, vt, h, w]
-            _, _, vt, rh, rw = ref_video_latent.shape
+            cond_video_latents.append(zi)
+        # (b) videos (kind=video, no paired audio for now -- paired video_audio
+        #     RefBlock is Phase C sub 5).
+        for zv in vid_latents_l:
+            # shape: [1, 24, vt, h, w]
+            _, _, vt, rh, rw = zv.shape
             refs.append(RefBlock(kind="video", latent_h=rh, latent_w=rw, latent_t=vt))
-            cond_video_latents.append(ref_video_latent)
-        if ref_audio_latent is not None:
-            # ref_audio_latent shape: [1, 32, 2, T]
-            rat = ref_audio_latent.shape[-1]
+            cond_video_latents.append(zv)
+        # (c) independent audios
+        for za in aud_latents_l:
+            # shape: [1, 32, 2, T]
+            rat = za.shape[-1]
             refs.append(RefBlock(kind="audio", ref_audio_t=rat))
-            cond_audio_latents.append(ref_audio_latent)
+            cond_audio_latents.append(za)
         if refs:
             payload["refs"] = refs
             payload["cond_video_latents"] = cond_video_latents
             payload["cond_audio_latents"] = cond_audio_latents
+        # Expose the multi-ref counts on payload so downstream tools/tests can
+        # verify order alignment against PackedLayout / context.
+        payload["ref_counts"] = {
+            "images": len(img_latents_l),
+            "videos": len(vid_latents_l),
+            "audios": len(aud_latents_l),
+        }
 
         # Cache layout across steps
         layout = PackedLayout(
@@ -413,8 +445,29 @@ class H3Pipeline:
             refs=refs if refs else None,
         )
         payload["layout"] = layout
+        # v17 260807 sub7/8: sequence-length estimate + safety guard.
+        # 40k tokens is a soft cap tuned to keep the DiT under ~120 GiB
+        # Metal-wired working set at bf16 with LoRA overlay -- larger runs
+        # OOM on 128 GB machines. Raise SAFE_MAX_SEQ_LEN to override.
+        SAFE_MAX_SEQ_LEN = int(getattr(self, "_safe_max_seq_len", 40000))
         if verbose:
-            print(f"[H3] packed seq_len={layout.seq_len}")
+            n_img = len(img_latents_l)
+            n_vid = len(vid_latents_l)
+            n_aud = len(aud_latents_l)
+            print(f"[H3] packed seq_len={layout.seq_len} "
+                  f"(refs: {n_img} image, {n_vid} video, {n_aud} audio; "
+                  f"text_len={text_len})")
+            if layout.seq_len > SAFE_MAX_SEQ_LEN * 0.8:
+                print(f"[H3] WARN: seq_len {layout.seq_len} approaching safe cap "
+                      f"{SAFE_MAX_SEQ_LEN}; consider fewer refs / smaller canvas")
+        if layout.seq_len > SAFE_MAX_SEQ_LEN:
+            raise RuntimeError(
+                f"[H3] refusing to run: packed seq_len={layout.seq_len} "
+                f"exceeds safe cap {SAFE_MAX_SEQ_LEN}. "
+                f"Drop some refs (1x768x1344 image ~= 1008 tokens, "
+                f"1x5s same-res video ~= 37296 tokens) or lower --width/--height. "
+                f"Override via pipe._safe_max_seq_len = <int> at your own risk."
+            )
 
         # v16 260807: fail-closed if an attached ModulationCache disagrees with the
         # run about num_steps / conditioning / schedule. Refuse to launch rather

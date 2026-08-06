@@ -183,10 +183,18 @@ def _run_ffmpeg(video_rgb: np.ndarray, audio_stereo: np.ndarray,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", required=True)
-    ap.add_argument("--ref-image", default=None)
-    ap.add_argument("--ref-video", default=None,
-                    help="Path to a reference video (mp4). Encoded via video_vae and used as kind='video' RefBlock.")
-    ap.add_argument("--ref-audio", default=None)
+    # v17 multiref 260807: --ref-image / --ref-video / --ref-audio are
+    # repeatable. Pass the flag multiple times to add more refs, in Comfy
+    # standard order (images -> videos -> audios). Back-compat: passing
+    # exactly one still works identically to the old single-ref API.
+    ap.add_argument("--ref-image", default=None, action="append",
+                    help="Reference image (repeatable, up to 9 per Comfy).")
+    ap.add_argument("--ref-video", default=None, action="append",
+                    help="Reference video mp4 (repeatable, up to 3 per Comfy). "
+                         "Encoded via video_vae as kind='video' RefBlock (audio track "
+                         "is currently dropped; paired video_audio is Phase C sub 5).")
+    ap.add_argument("--ref-audio", default=None, action="append",
+                    help="Reference audio (repeatable, up to 3 per Comfy).")
     ap.add_argument("--width", type=int, default=384)
     ap.add_argument("--height", type=int, default=576)
     ap.add_argument("--length", type=int, default=33)
@@ -232,9 +240,16 @@ def main():
 
     _log(f"mem(start): {_mem_snapshot()}")
 
-    ref_image_path = Path(args.ref_image).expanduser() if args.ref_image else None
-    ref_video_path = Path(args.ref_video).expanduser() if args.ref_video else None
-    ref_audio_path = Path(args.ref_audio).expanduser() if args.ref_audio else None
+    # v17 multiref: normalise to lists of resolved paths.
+    ref_image_paths = [Path(x).expanduser() for x in (args.ref_image or [])]
+    ref_video_paths = [Path(x).expanduser() for x in (args.ref_video or [])]
+    ref_audio_paths = [Path(x).expanduser() for x in (args.ref_audio or [])]
+    # Back-compat singletons (None if empty, first element otherwise).
+    ref_image_path = ref_image_paths[0] if ref_image_paths else None
+    ref_video_path = ref_video_paths[0] if ref_video_paths else None
+    ref_audio_path = ref_audio_paths[0] if ref_audio_paths else None
+    _log(f"multiref: {len(ref_image_paths)} image(s), "
+         f"{len(ref_video_paths)} video(s), {len(ref_audio_paths)} audio(s)")
 
     # ---------- Stage 1: text encoder ----------
     if args.context_npy is None:
@@ -247,14 +262,14 @@ def main():
         _log(f"encoder loaded in {time.time()-t0:.1f}s, {_mem_snapshot()}")
 
         _log(f"encoding prompt: {args.prompt!r}")
-        _log(f"  has_ref_image={ref_image_path is not None}, "
-             f"has_ref_video={ref_video_path is not None}, "
-             f"has_ref_audio={ref_audio_path is not None}")
+        _log(f"  n_ref_image={len(ref_image_paths)}, "
+             f"n_ref_video={len(ref_video_paths)}, "
+             f"n_ref_audio={len(ref_audio_paths)}")
         t0 = time.time()
         ctx = enc.encode(args.prompt,
-                         has_ref_image=ref_image_path is not None,
-                         has_ref_video=ref_video_path is not None,
-                         has_ref_audio=ref_audio_path is not None)
+                         has_ref_image=len(ref_image_paths),
+                         has_ref_video=len(ref_video_paths),
+                         has_ref_audio=len(ref_audio_paths))
         mx.eval(ctx)
         _log(f"encode done in {time.time()-t0:.2f}s, "
              f"context shape={ctx.shape}, dtype={ctx.dtype}, "
@@ -323,8 +338,8 @@ def main():
         problems = []
         if sig.num_steps != args.num_steps:
             problems.append(f"num_steps: bundle={sig.num_steps} run={args.num_steps}")
-        has_vis = (ref_image_path is not None or ref_video_path is not None)
-        has_aud = (ref_audio_path is not None)
+        has_vis = bool(ref_image_paths or ref_video_paths)
+        has_aud = bool(ref_audio_paths)
         if sig.has_visual_cond != has_vis:
             problems.append(f"has_visual_cond: bundle={sig.has_visual_cond} run={has_vis}")
         if sig.has_audio_cond != has_aud:
@@ -351,8 +366,8 @@ def main():
         active_before = _mx_c.get_active_memory() / 1024**3
         cache = pipe.build_adaln_cache_and_drop(
             num_steps=args.num_steps,
-            has_visual_cond=(ref_image_path is not None or ref_video_path is not None),
-            has_audio_cond=(ref_audio_path is not None),
+            has_visual_cond=bool(ref_image_paths or ref_video_paths),
+            has_audio_cond=bool(ref_audio_paths),
             verbose=True,
         )
         active_after = _mx_c.get_active_memory() / 1024**3
@@ -382,65 +397,73 @@ def main():
     # ---------- Stage 3: refs (image + audio) ----------
     import mlx.core as mx
 
-    ref_image_latent = None
-    if ref_image_path:
+    # v17 multiref: encode every image ref into ref_image_latents list.
+    ref_image_latents = []
+    if ref_image_paths:
         from PIL import Image
-        img = Image.open(ref_image_path).convert("RGB").resize(
-            (args.width, args.height), Image.LANCZOS)
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-        arr = arr * 2.0 - 1.0
-        arr = arr.transpose(2, 0, 1)[None, :, None, :, :]
-        ref_x = mx.array(arr)
-        ref_image_latent = pipe.video_vae.encode(ref_x)
-        _log(f"ref_image_latent shape: {ref_image_latent.shape}")
+        for idx, rp in enumerate(ref_image_paths):
+            img = Image.open(rp).convert("RGB").resize(
+                (args.width, args.height), Image.LANCZOS)
+            arr = np.asarray(img, dtype=np.float32) / 255.0
+            arr = arr * 2.0 - 1.0
+            arr = arr.transpose(2, 0, 1)[None, :, None, :, :]
+            ref_x = mx.array(arr)
+            zi = pipe.video_vae.encode(ref_x)
+            ref_image_latents.append(zi)
+            _log(f"ref_image_latents[{idx}] ({rp.name}) shape: {zi.shape}")
+    ref_image_latent = ref_image_latents[0] if ref_image_latents else None
 
-    ref_video_latent = None
-    if ref_video_path:
+    ref_video_latents = []
+    if ref_video_paths:
         import subprocess
-        # Decode video to raw rgb24 via ffmpeg
-        proc = subprocess.run(
-            ["ffprobe","-v","error","-select_streams","v:0",
-             "-show_entries","stream=width,height,nb_frames,r_frame_rate",
-             "-of","default=nw=1:nk=1", str(ref_video_path)],
-            capture_output=True, text=True, check=True)
-        pw, ph, nfr, rfr = proc.stdout.strip().split("\n")[:4]
-        pw, ph = int(pw), int(ph)
-        _log(f"ref_video probe: {pw}x{ph}, nb_frames={nfr}, fps={rfr}")
-        # Use ref video native res (multiple of 16 required by vae ratio),
-        # snap down to nearest 16 if needed.
-        rw = (pw // 16) * 16
-        rh = (ph // 16) * 16
-        raw = subprocess.run(
-            ["ffmpeg","-loglevel","error","-i",str(ref_video_path),
-             "-vf",f"scale={rw}:{rh},fps=24","-vframes","17",
-             "-pix_fmt","rgb24","-f","rawvideo","-"],
-            capture_output=True, check=True).stdout
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, rh, rw, 3)
-        _log(f"ref_video decoded frames={arr.shape[0]} at {rh}x{rw}")
-        # pad/truncate to multiple of clip_length (17 for h3)
-        T = 17
-        if arr.shape[0] < T:
-            arr = np.concatenate([arr, np.repeat(arr[-1:], T - arr.shape[0], axis=0)], axis=0)
-        else:
-            arr = arr[:T]
-        arr_f = arr.astype(np.float32) / 255.0
-        arr_f = arr_f * 2.0 - 1.0
-        # [T, H, W, 3] -> [1, 3, T, H, W]
-        arr_f = arr_f.transpose(3, 0, 1, 2)[None]
-        ref_v_x = mx.array(arr_f)
-        ref_video_latent = pipe.video_vae.encode(ref_v_x)
-        _log(f"ref_video_latent shape: {ref_video_latent.shape}")
+        for idx, rvp in enumerate(ref_video_paths):
+            # Decode video to raw rgb24 via ffmpeg.
+            proc = subprocess.run(
+                ["ffprobe","-v","error","-select_streams","v:0",
+                 "-show_entries","stream=width,height,nb_frames,r_frame_rate",
+                 "-of","default=nw=1:nk=1", str(rvp)],
+                capture_output=True, text=True, check=True)
+            pw, ph, nfr, rfr = proc.stdout.strip().split("\n")[:4]
+            pw, ph = int(pw), int(ph)
+            _log(f"ref_video[{idx}] probe ({rvp.name}): {pw}x{ph}, "
+                 f"nb_frames={nfr}, fps={rfr}")
+            rw = (pw // 16) * 16
+            rh = (ph // 16) * 16
+            raw = subprocess.run(
+                ["ffmpeg","-loglevel","error","-i",str(rvp),
+                 "-vf",f"scale={rw}:{rh},fps=24","-vframes","17",
+                 "-pix_fmt","rgb24","-f","rawvideo","-"],
+                capture_output=True, check=True).stdout
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, rh, rw, 3)
+            _log(f"ref_video[{idx}] decoded frames={arr.shape[0]} at {rh}x{rw}")
+            T = 17
+            if arr.shape[0] < T:
+                arr = np.concatenate(
+                    [arr, np.repeat(arr[-1:], T - arr.shape[0], axis=0)], axis=0)
+            else:
+                arr = arr[:T]
+            arr_f = arr.astype(np.float32) / 255.0
+            arr_f = arr_f * 2.0 - 1.0
+            arr_f = arr_f.transpose(3, 0, 1, 2)[None]
+            ref_v_x = mx.array(arr_f)
+            zv = pipe.video_vae.encode(ref_v_x)
+            ref_video_latents.append(zv)
+            _log(f"ref_video_latents[{idx}] shape: {zv.shape}")
+    ref_video_latent = ref_video_latents[0] if ref_video_latents else None
 
-    ref_audio_latent = None
-    if ref_audio_path:
+    ref_audio_latents = []
+    if ref_audio_paths:
         from scipy.io import wavfile
-        sr, wav = wavfile.read(ref_audio_path)
-        if wav.ndim == 1:
-            wav = np.stack([wav, wav], axis=-1)
-        wav = wav.astype(np.float32) / 32768.0
-        wav_mx = mx.array(wav.T[None, ...])
-        ref_audio_latent = pipe.audio_vae.encode(wav_mx)
-        _log(f"ref_audio_latent shape: {ref_audio_latent.shape}")
+        for idx, rap in enumerate(ref_audio_paths):
+            sr, wav = wavfile.read(rap)
+            if wav.ndim == 1:
+                wav = np.stack([wav, wav], axis=-1)
+            wav = wav.astype(np.float32) / 32768.0
+            wav_mx = mx.array(wav.T[None, ...])
+            za = pipe.audio_vae.encode(wav_mx)
+            ref_audio_latents.append(za)
+            _log(f"ref_audio_latents[{idx}] ({rap.name}) shape: {za.shape}")
+    ref_audio_latent = ref_audio_latents[0] if ref_audio_latents else None
 
     # v16 260807 Sub4: turn on phase-evict AFTER refs are encoded so we don't
     # trip the "video_vae was evicted" check inside pipe.video_vae.encode above.
@@ -458,9 +481,9 @@ def main():
         prompt=args.prompt,  # ignored because context= is provided
         width=args.width, height=args.height, length=args.length,
         num_steps=args.num_steps, seed=args.seed,
-        ref_image_latent=ref_image_latent,
-        ref_video_latent=ref_video_latent,
-        ref_audio_latent=ref_audio_latent,
+        ref_image_latents=ref_image_latents,
+        ref_video_latents=ref_video_latents,
+        ref_audio_latents=ref_audio_latents,
         verbose=True,
         context=ctx_mx,
     )

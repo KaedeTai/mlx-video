@@ -59,8 +59,8 @@ class DummyTextEncoder:
     max_len: int = 128
     seed: int = 0
 
-    def encode(self, prompt: str, has_ref_image: bool = False,
-               has_ref_audio: bool = False, has_ref_video: bool = False) -> mx.array:
+    def encode(self, prompt: str, has_ref_image=False,
+               has_ref_audio=False, has_ref_video=False) -> mx.array:
         L = min(max(4, len(prompt.split()) * 2), self.max_len)
         rng = np.random.default_rng(self.seed)
         emb = rng.standard_normal((1, L, self.text_dim)).astype(np.float32) * 0.01
@@ -72,20 +72,46 @@ class DummyTextEncoder:
 # ---------------------------------------------------------------------------
 
 
-def format_ref2va_prompt(prompt: str, has_ref_image: bool, has_ref_audio: bool, has_ref_video: bool = False) -> str:
-    """Prepend "<Picture 1>: " / "<Audio 1>: " prefixes per ref2va format.
+def _as_count(x) -> int:
+    """Accept bool / int / None / list for back-compat; return a count >= 0."""
+    if x is None or x is False:
+        return 0
+    if x is True:
+        return 1
+    if isinstance(x, int):
+        return max(0, x)
+    try:
+        return len(x)
+    except TypeError:
+        return 1 if x else 0
+
+
+def format_ref2va_prompt(prompt: str,
+                         has_ref_image=False,
+                         has_ref_audio=False,
+                         has_ref_video=False) -> str:
+    """Prepend ``<Picture N>: ``/``<Video N>: ``/``<Audio N>: `` per ref2va format.
+
+    v17 multiref 260807 (sub 3): each ``has_ref_*`` argument may be a bool
+    (back-compat, treated as count 1) or an int/list giving the number of
+    refs of that type. Labels are emitted in Comfy standard order
+    (images -> videos -> audios) with 1-based ordinals.
 
     ComfyUI splices actual vision tokens between VISION_START/VISION_END for
-    the image; we ship only the text prefix in Phase 8.9-b (still restores
-    intelligibility because it matches the H3 training presentation).
+    each image; we ship only the text prefix (Phase 8.9-b/v17). Full vision
+    token splicing is Phase B sub 4.
     """
+    n_img = _as_count(has_ref_image)
+    n_vid = _as_count(has_ref_video)
+    n_aud = _as_count(has_ref_audio)
     parts = []
-    if has_ref_video:
-        parts.append("<Video 1>: ")
-    if has_ref_image:
-        parts.append("<Picture 1>: ")
-    if has_ref_audio:
-        parts.append("<Audio 1>: ")
+    # Comfy standard order: images -> videos -> audios.
+    for i in range(1, n_img + 1):
+        parts.append(f"<Picture {i}>: ")
+    for i in range(1, n_vid + 1):
+        parts.append(f"<Video {i}>: ")
+    for i in range(1, n_aud + 1):
+        parts.append(f"<Audio {i}>: ")
     parts.append(prompt or "")
     return "".join(parts)
 
@@ -163,9 +189,9 @@ class TextEncoderBridge:
         mx.eval(h)
         return h
 
-    def encode(self, prompt: str, has_ref_image: bool = False,
-               has_ref_audio: bool = False, has_ref_video: bool = False) -> mx.array:
-        # Legacy encoder — ref-flags accepted for API parity but ignored.
+    def encode(self, prompt: str, has_ref_image=False,
+               has_ref_audio=False, has_ref_video=False) -> mx.array:
+        # Legacy encoder -- ref-flags accepted for API parity but ignored.
         return self._encode_no_vision(prompt)
 
 
@@ -346,13 +372,15 @@ class H3TextEncoderBridge:
         mx.eval(h)
         return h
 
-    def encode(self, prompt: str, has_ref_image: bool = False,
-               has_ref_audio: bool = False, has_ref_video: bool = False) -> mx.array:
+    def encode(self, prompt: str, has_ref_image=False,
+               has_ref_audio=False, has_ref_video=False) -> mx.array:
         """Return the layer-50 unnormalized hidden state as ``[1, L, 5120]``.
 
-        The ref2va text prefixes (``<Picture 1>: `` / ``<Audio 1>: ``) are
-        prepended automatically when the flags are True. Vision-token
-        splicing is not implemented in Phase 8.9-b.
+        v17 multiref 260807: ``has_ref_*`` may be a bool (back-compat, count=1)
+        OR an int/list giving the number of refs of that type. Labels are
+        auto-numbered (``<Picture 1>: <Picture 2>: ...``) in Comfy standard
+        order (images -> videos -> audios). Vision-token splicing is Phase B
+        sub 4 (still deferred here).
         """
         prefixed = format_ref2va_prompt(prompt, has_ref_image, has_ref_audio, has_ref_video)
         input_ids = self._tokenize(prefixed)
