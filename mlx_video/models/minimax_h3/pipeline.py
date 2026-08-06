@@ -108,67 +108,62 @@ class H3Pipeline:
         import time as _time
         from .modulation_cache import (
             ModulationCache, drop_adaln_weights, schedule_timesteps_with_keys,
+            per_step_unique_t, verify_cache_bitwise,
         )
         # Populate scheduler.sigmas so we know the union of unique-t values.
         self.scheduler.set_timesteps(num_steps)
+        sigmas_list = self.scheduler.sigmas.tolist()
         keys, timesteps = schedule_timesteps_with_keys(
-            self.scheduler.sigmas.tolist(),
+            sigmas_list,
+            has_visual_cond=has_visual_cond,
+            has_audio_cond=has_audio_cond,
+            shift_video=self.scheduler.shift_video,
+            shift_audio=self.scheduler.shift_audio,
+        )
+        # Per-step unique_t (mirrors what MiniMaxH3Model.__call__ computes each step)
+        step_ut = per_step_unique_t(
+            sigmas_list,
             has_visual_cond=has_visual_cond,
             has_audio_cond=has_audio_cond,
             shift_video=self.scheduler.shift_video,
             shift_audio=self.scheduler.shift_audio,
         )
         if verbose:
-            print(f"[adaln-cache] building for {timesteps.shape[0]} unique timesteps "
+            m_hist = [len(x) for x in step_ut]
+            print(f"[adaln-cache] building for {timesteps.shape[0]} unique timesteps, "
+                  f"{len(step_ut)} steps M={m_hist} "
                   f"(visual_cond={has_visual_cond}, audio_cond={has_audio_cond})...")
         t0 = _time.time()
-        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.float32, key_values=keys)
+        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.float32, key_values=keys, per_step_ut=step_ut)
         # Attach BEFORE dropping so a botched drop still leaves an intact model behind a cache.
         self.dit._modulation_cache = cache
         build_s = _time.time() - t0
         if verbose:
-            print(f"[adaln-cache] built in {build_s:.1f}s, size {cache.nbytes()/1e6:.1f} MB")
+            print(f"[adaln-cache] built in {build_s:.1f}s, "
+                  f"size {cache.nbytes()/1024**2:.1f} MiB")
 
-        # ---- Bitwise verify (v15 260807 Fix 5): confirm the cache rows match a live
-        # ``adaln_proj`` call before we drop the weights. If diverged, DO NOT drop.
-        try:
-            sanity_key = keys[0]
-            sanity_t = timesteps[0:1]
-            t_emb_single = self.dit.time_embedder(sanity_t)
-            live_mod = self.dit.blocks[0].adaln_proj(t_emb_single)  # tuple of 6 [3, hidden]
-            cached_mod = cache.gather(0, [sanity_key])  # tuple of 6 [3, hidden]
-            diffs = []
-            for lv, cv in zip(live_mod, cached_mod):
-                d = float(mx.max(mx.abs(lv.astype(mx.float32) - cv.astype(mx.float32))).item())
-                diffs.append(d)
-            max_diff = max(diffs)
-            if verbose:
-                print(f"[adaln-cache] BITWISE verify block0 step {sanity_key}: "
-                      f"max|live - cached| = {max_diff:.3e} (per-tuple {diffs})")
-            if max_diff >= 1e-5:
-                raise RuntimeError(
-                    f"[adaln-cache] BITWISE verify FAILED: max diff {max_diff:.3e} >= 1e-5. "
-                    "Refusing to drop adaln weights — cache is not equivalent to live forward."
-                )
-        except Exception as e:
-            if "BITWISE verify FAILED" in str(e):
-                raise
-            # Non-fatal diagnostic error — log and proceed.
-            if verbose:
-                print(f"[adaln-cache] BITWISE verify skipped: {e!r}")
+        # ---- v15 260807 bugfix #1/#2: RIGOROUS bitwise verify across every block,
+        # every step, every tuple + NaN/Inf sweep. FAIL-CLOSED: any exception raises
+        # and blocks the drop. Do NOT swallow verify errors -- a "skipped" verify
+        # followed by a weight drop leaves the model silently broken.
+        verify_cache_bitwise(
+            cache, self.dit, step_ut,
+            verify_final=cache.final_table is not None,
+            verbose=verbose,
+        )
 
         t0 = _time.time()
         freed = drop_adaln_weights(self.dit, drop_final=True)
         drop_s = _time.time() - t0
         if verbose:
-            print(f"[adaln-cache] dropped adaln_proj weights, freed {freed/1e9:.2f} GB "
-                  f"in {drop_s:.1f}s")
-        # Fix 4: sanity assertion — dropping the 50-block adaln bank should free >=20 GB
-        # (bf16 in mlx-video: ~26 GB; Q4/Q8: less but still large). If well under, the
+            print(f"[adaln-cache] dropped adaln_proj weights, "
+                  f"freed {freed/1024**3:.2f} GiB in {drop_s:.1f}s")
+        # Fix 4: sanity assertion -- dropping the 50-block adaln bank should free >=20 GiB
+        # (bf16 in mlx-video: ~26 GiB; Q4/Q8: less but still large). If well under, the
         # drop path missed arrays and we should not silently proceed.
         assert freed >= 20 * 1024**3, (
-            f"[adaln-cache] freed only {freed/1e9:.2f} GB, expected >=20 GB "
-            "— drop path likely missed base/LoRA arrays"
+            f"[adaln-cache] freed only {freed/1024**3:.2f} GiB, expected >=20 GiB "
+            "-- drop path likely missed base/LoRA arrays"
         )
         return cache
 
@@ -337,10 +332,20 @@ class H3Pipeline:
 
         audio_np = np.asarray(audio_waveform).astype(np.float32)[0]  # [C=2, T]
 
-        peak_rss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # v15 260807 bugfix #4: on macOS ru_maxrss is BYTES (not KiB as on Linux).
+        # bytes / (1024**3) -> GiB. Previous code did bytes / 1024 / 1024 -> MiB
+        # but labelled it "GB" (produced values like 25779 "GB" that were actually MiB).
+        import sys as _sys
+        _ru = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        if _sys.platform == "darwin":
+            process_rss_gib = _ru / 1024**3          # bytes -> GiB
+        else:
+            process_rss_gib = _ru / 1024 / 1024      # KiB   -> GiB
         info = {
             "wall_time_s": _time.time() - t0,
-            "peak_rss_gb": peak_rss_kb / 1024 / 1024,
+            "process_rss_gib": process_rss_gib,
+            # Back-compat alias (deprecated): older callers read this key.
+            "peak_rss_gb": process_rss_gib,
             "num_steps": num_steps,
             "frame_count": frame_count,
             "video_shape": tuple(video_np.shape),

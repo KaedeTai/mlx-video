@@ -33,8 +33,90 @@ def _log(msg: str):
     print(f"[phase89b {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _peak_rss_gb() -> float:
-    return _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024**3
+def _peak_rss_gib() -> float:
+    """Process peak RSS in GiB.
+
+    v15 260807 bugfix #4: on macOS ``ru_maxrss`` is BYTES, on Linux it is KiB.
+    Convert to GiB accordingly. Historically this function divided bytes by
+    1024**3 (correct on darwin) but the callers labelled the number "GB" while
+    also using a helper name ``_peak_rss_gb`` -- keep the label as ``GiB``
+    everywhere to match the arithmetic and avoid the 25779 "GB" -> 25.17 GiB
+    mislabel bug.
+
+    v15 260807 bugfix #5: process RSS on macOS does NOT include Metal
+    driver-wired memory that MLX allocates via the IOKit path -- the true
+    footprint can be 50-66 GiB while ``ru_maxrss`` reports only 25 GiB. Use
+    ``_system_metal_footprint_gib()`` (vm_stat wired+active pages) to see
+    what the OS actually thinks the process family is using.
+    """
+    import sys as _sys
+    ru = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+    if _sys.platform == "darwin":
+        return ru / 1024**3   # bytes -> GiB
+    return ru / 1024 / 1024   # KiB -> GiB
+
+
+# Cache the page size so we don't shell out for every log line.
+_VM_PAGE_SIZE_CACHE: int = 0
+
+
+def _vm_page_size() -> int:
+    global _VM_PAGE_SIZE_CACHE
+    if _VM_PAGE_SIZE_CACHE:
+        return _VM_PAGE_SIZE_CACHE
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            if "page size of" in line:
+                # e.g. "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+                _VM_PAGE_SIZE_CACHE = int(line.split("page size of")[1].split("bytes")[0].strip())
+                return _VM_PAGE_SIZE_CACHE
+    except Exception:
+        pass
+    _VM_PAGE_SIZE_CACHE = 16384  # apple silicon default
+    return _VM_PAGE_SIZE_CACHE
+
+
+def _system_metal_footprint_gib() -> float:
+    """System-wide (wired + active) memory in GiB from ``vm_stat``.
+
+    On macOS the DiT weights that MLX pushes to the GPU end up in Metal-wired
+    or Metal-active pages that DO NOT count against per-process RSS. To see
+    the real "how much RAM is this run consuming" number we need the OS-level
+    wired+active total. Not perfectly attributable to this Python process --
+    other processes contribute too -- but delta between snapshots taken
+    before/after model load is a reliable Metal footprint proxy.
+    """
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, check=True).stdout
+    except Exception:
+        return 0.0
+    wired_pages = active_pages = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Pages wired down:"):
+            wired_pages = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+        elif line.startswith("Pages active:"):
+            active_pages = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+    return (wired_pages + active_pages) * _vm_page_size() / 1024**3
+
+
+def _mem_snapshot() -> str:
+    """Compact one-line memory snapshot: process RSS + system wired+active."""
+    try:
+        import mlx.core as _mx
+        mlx_active = _mx.get_active_memory() / 1024**3
+        mlx_peak = _mx.get_peak_memory() / 1024**3
+        mlx_str = f", mlx_active={mlx_active:.2f} GiB, mlx_peak={mlx_peak:.2f} GiB"
+    except Exception:
+        mlx_str = ""
+    return (f"process_rss={_peak_rss_gib():.2f} GiB, "
+            f"system_metal_footprint={_system_metal_footprint_gib():.2f} GiB"
+            f"{mlx_str}")
+
+
+# Back-compat alias so any older log line still runs.
+_peak_rss_gb = _peak_rss_gib
 
 
 def _run_ffmpeg(video_rgb: np.ndarray, audio_stereo: np.ndarray,
@@ -58,16 +140,44 @@ def _run_ffmpeg(video_rgb: np.ndarray, audio_stereo: np.ndarray,
             with wave.open(str(raw_audio), "wb") as wf:
                 wf.setnchannels(2); wf.setsampwidth(2); wf.setframerate(sample_rate)
                 wf.writeframes(audio_int16.tobytes())
+        # v15 260807 bugfix #6: previously used "-shortest" which trims to whichever
+        # stream ends first. Because H3's audio VAE occasionally emits a waveform that
+        # is a few samples shorter than exactly ``T / fps`` seconds, "-shortest" was
+        # dropping the last frame (56 -> 55 in the observed case). Fix: explicitly
+        # tell ffmpeg the exact video frame count and drop -shortest. The video
+        # stream is authoritative; ffmpeg will pad audio with silence if needed.
         cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{W}x{H}", "-r", str(fps), "-i", str(raw_video),
             "-i", str(raw_audio),
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-shortest",
+            "-frames:v", str(T),
+            "-c:a", "aac", "-b:a", "128k",
+            # Pad audio with silence to at least video length so audio isn't cut short.
+            "-af", "apad",
             str(out_path),
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Post-mux frame-count sanity check: if the resulting mp4 has fewer video
+        # frames than requested, surface the error immediately.
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-count_frames", "-show_entries", "stream=nb_read_frames",
+                 "-of", "default=nk=1:nw=1", str(out_path)],
+                capture_output=True, text=True, check=True,
+            )
+            got = int(probe.stdout.strip())
+            if got != T:
+                raise RuntimeError(
+                    f"[mux] frame count mismatch: wrote {got}, expected {T} "
+                    f"(video_rgb has {T} frames)"
+                )
+        except (subprocess.CalledProcessError, ValueError) as e:
+            # Non-fatal: probe unavailable / unparseable -- still emit a warning
+            print(f"[mux] warning: could not verify frame count: {e!r}")
 
 
 def main():
@@ -107,7 +217,7 @@ def main():
                          "trading ~+30-40 ms/step for a lower peak Metal working set.")
     args = ap.parse_args()
 
-    _log(f"peak_rss(start)={_peak_rss_gb():.2f} GB")
+    _log(f"mem(start): {_mem_snapshot()}")
 
     ref_image_path = Path(args.ref_image).expanduser() if args.ref_image else None
     ref_video_path = Path(args.ref_video).expanduser() if args.ref_video else None
@@ -121,8 +231,7 @@ def main():
         _log("stage 1: loading H3TextEncoderBridge...")
         t0 = time.time()
         enc = H3TextEncoderBridge(model_path=args.encoder_path)
-        _log(f"encoder loaded in {time.time()-t0:.1f}s, "
-             f"peak_rss={_peak_rss_gb():.2f} GB")
+        _log(f"encoder loaded in {time.time()-t0:.1f}s, {_mem_snapshot()}")
 
         _log(f"encoding prompt: {args.prompt!r}")
         _log(f"  has_ref_image={ref_image_path is not None}, "
@@ -154,7 +263,7 @@ def main():
             mx.clear_cache()  # release wired arenas
         except AttributeError:
             pass
-        _log(f"encoder freed, peak_rss={_peak_rss_gb():.2f} GB")
+        _log(f"encoder freed, {_mem_snapshot()}")
     else:
         _log(f"loading pre-saved context from {args.context_npy}")
         ctx_np = np.load(Path(args.context_npy).expanduser())
@@ -169,8 +278,7 @@ def main():
     t0 = time.time()
     from mlx_video.models.minimax_h3.pipeline import load_pipeline
     pipe = load_pipeline(Path(args.model_root).expanduser())
-    _log(f"pipeline loaded in {time.time()-t0:.1f}s, "
-         f"peak_rss={_peak_rss_gb():.2f} GB")
+    _log(f"pipeline loaded in {time.time()-t0:.1f}s, {_mem_snapshot()}")
 
     if args.turbo_lora:
         from mlx_video.models.minimax_h3.lora import load_turbo_lora
@@ -178,8 +286,7 @@ def main():
         t_l = time.time()
         n_wrapped = load_turbo_lora(pipe.dit, args.turbo_lora,
                                      alpha=args.turbo_lora_alpha, verbose=True)
-        _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, "
-             f"peak_rss={_peak_rss_gb():.2f} GB")
+        _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, {_mem_snapshot()}")
 
     # v15: AdaLN cache before LayerGroupManager so eviction snapshot excludes dropped adaln.
     if args.adaln_cache:
@@ -196,8 +303,8 @@ def main():
         active_after = _mx_c.get_active_memory() / 1024**3
         _log(f"adaln cache: {cache.num_timesteps} timesteps, "
              f"{cache.nbytes()/1e6:.1f} MB lookup table")
-        _log(f"active_mlx {active_before:.2f} GB -> {active_after:.2f} GB "
-             f"in {time.time()-t_c:.1f}s, peak_rss={_peak_rss_gb():.2f} GB")
+        _log(f"active_mlx {active_before:.2f} GiB -> {active_after:.2f} GiB "
+             f"in {time.time()-t_c:.1f}s, {_mem_snapshot()}")
 
     if args.layer_group_size > 0:
         _log(f"enabling LayerGroupManager (group_size={args.layer_group_size})")
@@ -208,9 +315,9 @@ def main():
                                                 verbose=True)
         active_after = mx.get_active_memory() / 1024**3
         _log(f"LayerGroupManager installed in {time.time()-t_g:.1f}s, "
-             f"active_mlx {active_before:.2f} GB -> {active_after:.2f} GB, "
-             f"dormant={mgr.stats()['dormant_gb']:.2f} GB, "
-             f"peak_rss={_peak_rss_gb():.2f} GB")
+             f"active_mlx {active_before:.2f} GiB -> {active_after:.2f} GiB, "
+             f"dormant={mgr.stats()['dormant_gb']:.2f} GiB, "
+             f"{_mem_snapshot()}")
 
     # ---------- Stage 3: refs (image + audio) ----------
     import mlx.core as mx
@@ -292,8 +399,8 @@ def main():
     )
     _log(f"generate done in {time.time()-t0:.1f}s, info={info}")
     try:
-        _log(f"mlx peak={mx.get_peak_memory()/1024**3:.2f} GB, "
-             f"active={mx.get_active_memory()/1024**3:.2f} GB")
+        _log(f"mlx peak={mx.get_peak_memory()/1024**3:.2f} GiB, "
+             f"active={mx.get_active_memory()/1024**3:.2f} GiB")
     except Exception:
         pass
 
@@ -302,7 +409,7 @@ def main():
     _log(f"muxing to {out_path}...")
     _run_ffmpeg(video_np, audio_np, fps=24, sample_rate=32000, out_path=out_path)
     _log(f"wrote {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
-    _log(f"peak_rss(final)={_peak_rss_gb():.2f} GB")
+    _log(f"mem(final): {_mem_snapshot()}")
 
 
 if __name__ == "__main__":
