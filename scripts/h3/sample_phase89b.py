@@ -93,6 +93,10 @@ def main():
                     help="Also save the encoded context to this .npy path")
     ap.add_argument("--dry-encode", action="store_true",
                     help="Just encode and save context; skip DiT")
+    ap.add_argument("--turbo-lora", default=None,
+                    help="Path to Turbo LoRA safetensors for 4-step sampling (runtime overlay)")
+    ap.add_argument("--turbo-lora-alpha", default=1.0, type=float,
+                    help="LoRA scale factor (default 1.0)")
     args = ap.parse_args()
 
     _log(f"peak_rss(start)={_peak_rss_gb():.2f} GB")
@@ -159,6 +163,15 @@ def main():
     pipe = load_pipeline(Path(args.model_root).expanduser())
     _log(f"pipeline loaded in {time.time()-t0:.1f}s, "
          f"peak_rss={_peak_rss_gb():.2f} GB")
+
+    if args.turbo_lora:
+        from mlx_video.models.minimax_h3.lora import load_turbo_lora
+        _log(f"loading Turbo LoRA: {args.turbo_lora} (alpha={args.turbo_lora_alpha})")
+        t_l = time.time()
+        n_wrapped = load_turbo_lora(pipe.dit, args.turbo_lora,
+                                     alpha=args.turbo_lora_alpha, verbose=True)
+        _log(f"Turbo LoRA installed: {n_wrapped} modules in {time.time()-t_l:.1f}s, "
+             f"peak_rss={_peak_rss_gb():.2f} GB")
 
     # ---------- Stage 3: refs (image + audio) ----------
     import mlx.core as mx

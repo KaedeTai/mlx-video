@@ -33,6 +33,18 @@ import mlx.core as mx
 import numpy as np
 
 
+def _time_shift_sigma(sigma: float, fr: float, to: float) -> float:
+    """Scalar analogue of ComfyUI's time_shift_sigma (base t recovery then re-shift)."""
+    base = sigma / (fr + sigma * (1.0 - fr))
+    return to * base / (1.0 + (to - 1.0) * base)
+
+
+def _time_shift_slope(sigma: float, fr: float, to: float) -> float:
+    """d(sigma_to)/d(sigma_fr) at sigma (matches ComfyUI's time_shift_slope)."""
+    base = sigma / (fr + sigma * (1.0 - fr))
+    return (to * (1.0 + (fr - 1.0) * base) ** 2) / (fr * (1.0 + (to - 1.0) * base) ** 2)
+
+
 def time_snr_shift(shift: float, t: np.ndarray) -> np.ndarray:
     """Vector version of ComfyUI's ``time_snr_shift(alpha, t)``."""
     if shift == 1.0:
@@ -99,9 +111,22 @@ class MiniMaxH3Scheduler:
         sigma_cur: float, sigma_next: float,
         x_v: mx.array, x_a: mx.array,
     ) -> Tuple[mx.array, mx.array]:
-        d_sigma = sigma_next - sigma_cur  # negative (denoising)
-        x_v_next = x_v + model_v * d_sigma
-        x_a_next = x_a + model_a * d_sigma
+        d_sigma_v = sigma_next - sigma_cur  # negative (denoising)
+        x_v_next = x_v + model_v * d_sigma_v
+
+        # Exact shifted-sigma delta for the audio branch (plan sec.7 fix).
+        # model_a is (-slope_a(sigma_cur) * audio_out); recover the true audio
+        # delta from the exact audio sigma difference across the step:
+        #     d_sigma_a = time_shift_sigma(sv_n, 12, 3) - time_shift_sigma(sv, 12, 3)
+        #     x_a += (model_a / slope_a) * d_sigma_a
+        # which equals (-audio_out) * d_sigma_a. At many steps the linear
+        # d_sigma_v form and the exact form agree; at 4-step Turbo they
+        # differ by a large fraction of the audio latent norm.
+        d_sigma_a = _time_shift_sigma(sigma_next, self.shift_video, self.shift_audio) \
+                    - _time_shift_sigma(sigma_cur, self.shift_video, self.shift_audio)
+        slope_a = _time_shift_slope(sigma_cur, self.shift_video, self.shift_audio)
+        audio_delta_scale = d_sigma_a / slope_a
+        x_a_next = x_a + model_a * audio_delta_scale
         return x_v_next, x_a_next
 
     # ------------------------------------------------------------------
