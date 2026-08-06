@@ -195,6 +195,12 @@ def main():
                          "is currently dropped; paired video_audio is Phase C sub 5).")
     ap.add_argument("--ref-audio", default=None, action="append",
                     help="Reference audio (repeatable, up to 3 per Comfy).")
+    ap.add_argument("--ref-video-audio", default=None, action="append",
+                    help="Audio track paired with the same-index --ref-video "
+                         "(sub 5, kind='video_audio' RefBlock). Feed a wav "
+                         "matched to the ref video for lip-sync driving. Use "
+                         "the sentinel 'none' to skip pairing for one video "
+                         "while still pairing others.")
     ap.add_argument("--width", type=int, default=384)
     ap.add_argument("--height", type=int, default=576)
     ap.add_argument("--length", type=int, default=33)
@@ -244,12 +250,29 @@ def main():
     ref_image_paths = [Path(x).expanduser() for x in (args.ref_image or [])]
     ref_video_paths = [Path(x).expanduser() for x in (args.ref_video or [])]
     ref_audio_paths = [Path(x).expanduser() for x in (args.ref_audio or [])]
+    # Paired-per-video audio paths (sub 5). If shorter than ref_video_paths we
+    # pad with None so unpaired videos keep kind='video'. The literal string
+    # 'none' also means "no pairing for this slot".
+    def _pair_path(x):
+        if x is None or str(x).strip().lower() == "none":
+            return None
+        return Path(x).expanduser()
+    ref_video_audio_paths = [_pair_path(x) for x in (args.ref_video_audio or [])]
+    if len(ref_video_audio_paths) < len(ref_video_paths):
+        ref_video_audio_paths += [None] * (len(ref_video_paths) - len(ref_video_audio_paths))
+    elif len(ref_video_audio_paths) > len(ref_video_paths):
+        raise SystemExit(
+            f"--ref-video-audio was passed {len(ref_video_audio_paths)} times "
+            f"but only {len(ref_video_paths)} --ref-video refs were given"
+        )
+    n_paired = sum(1 for x in ref_video_audio_paths if x is not None)
     # Back-compat singletons (None if empty, first element otherwise).
     ref_image_path = ref_image_paths[0] if ref_image_paths else None
     ref_video_path = ref_video_paths[0] if ref_video_paths else None
     ref_audio_path = ref_audio_paths[0] if ref_audio_paths else None
     _log(f"multiref: {len(ref_image_paths)} image(s), "
-         f"{len(ref_video_paths)} video(s), {len(ref_audio_paths)} audio(s)")
+         f"{len(ref_video_paths)} video(s) ({n_paired} paired-audio), "
+         f"{len(ref_audio_paths)} independent audio(s)")
 
     # ---------- Stage 1: text encoder ----------
     if args.context_npy is None:
@@ -465,6 +488,26 @@ def main():
             _log(f"ref_audio_latents[{idx}] ({rap.name}) shape: {za.shape}")
     ref_audio_latent = ref_audio_latents[0] if ref_audio_latents else None
 
+    # Sub 5: paired ref-video-audio -> list[Optional[mx.array]] aligned with
+    # ref_video_paths. Same audio_vae; use 'none' entries to keep kind='video'
+    # for that slot.
+    ref_video_audio_latents: list = []
+    if ref_video_paths:
+        from scipy.io import wavfile
+        for idx, rvap in enumerate(ref_video_audio_paths):
+            if rvap is None:
+                ref_video_audio_latents.append(None)
+                continue
+            sr, wav = wavfile.read(rvap)
+            if wav.ndim == 1:
+                wav = np.stack([wav, wav], axis=-1)
+            wav = wav.astype(np.float32) / 32768.0
+            wav_mx = mx.array(wav.T[None, ...])
+            zva = pipe.audio_vae.encode(wav_mx)
+            ref_video_audio_latents.append(zva)
+            _log(f"ref_video_audio_latents[{idx}] paired with "
+                 f"{ref_video_paths[idx].name} ({rvap.name}) shape: {zva.shape}")
+
     # v16 260807 Sub4: turn on phase-evict AFTER refs are encoded so we don't
     # trip the "video_vae was evicted" check inside pipe.video_vae.encode above.
     if args.phase_evict:
@@ -484,6 +527,9 @@ def main():
         ref_image_latents=ref_image_latents,
         ref_video_latents=ref_video_latents,
         ref_audio_latents=ref_audio_latents,
+        ref_video_audios=(ref_video_audio_latents
+                          if ref_video_paths and any(x is not None for x in ref_video_audio_latents)
+                          else None),
         verbose=True,
         context=ctx_mx,
     )

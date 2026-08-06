@@ -173,3 +173,66 @@ def test_dummy_text_encoder_accepts_int_counts():
     enc = DummyTextEncoder()
     out = enc.encode("x", has_ref_image=3, has_ref_video=0, has_ref_audio=2)
     assert out.shape[0] == 1
+
+
+def test_paired_video_audio_ref_block_orders_audio_before_video():
+    """Sub 5: kind='video_audio' packs the paired audio right before the video's
+    image rows. The three accumulators must stay in the same order."""
+    imgs = [_fake_img_latent()]
+    vids = [_fake_vid_latent(vt=2), _fake_vid_latent(vt=2)]
+    paired = [_fake_aud_latent(t=100), None]  # first video paired, second not
+    indep_auds = [_fake_aud_latent(t=200)]
+
+    # Reproduce pipeline.generate's ref/latent builder with paired handling.
+    refs = []
+    cv = []
+    ca = []
+    for zi in imgs:
+        refs.append(RefBlock(kind="image", latent_h=zi.shape[3], latent_w=zi.shape[4]))
+        cv.append(zi)
+    for zv, zva in zip(vids, paired):
+        _, _, vt, rh, rw = zv.shape
+        if zva is not None:
+            rat = zva.shape[-1]
+            refs.append(RefBlock(kind="video_audio", latent_h=rh, latent_w=rw,
+                                 latent_t=vt, ref_audio_t=rat))
+            cv.append(zv)
+            ca.append(zva)  # paired audio precedes video in packed layout
+        else:
+            refs.append(RefBlock(kind="video", latent_h=rh, latent_w=rw, latent_t=vt))
+            cv.append(zv)
+    for za in indep_auds:
+        refs.append(RefBlock(kind="audio", ref_audio_t=za.shape[-1]))
+        ca.append(za)
+
+    layout = PackedLayout(
+        text_len=32, latent_t=2, latent_h=48, latent_w=84, audio_t=100,
+        refs=refs,
+    )
+
+    # Kinds check.
+    assert [r.kind for r in refs] == ["image", "video_audio", "video", "audio"]
+
+    # cond_video_latents identity order == image + both videos.
+    assert cv[0] is imgs[0] and cv[1] is vids[0] and cv[2] is vids[1]
+    # cond_audio_latents identity order == paired then independent.
+    assert ca[0] is paired[0] and ca[1] is indep_auds[0]
+
+    # PackedLayout segment order: text -> ref_img (image) ->
+    # ref_audio (paired) -> ref_img (video_audio's video rows) ->
+    # ref_img (plain video) -> audio (target) -> video (target).
+    seg_kinds = [k for _, _, k in layout.segments]
+    assert seg_kinds == [
+        "text",
+        "ref_img",       # image ref
+        "ref_audio",     # paired audio (before its video)
+        "ref_img",       # video_audio's video rows
+        "ref_img",       # plain video's rows
+        "ref_audio",     # independent audio
+        "audio", "video",
+    ], seg_kinds
+
+    # Number of audio-pos rows must equal sum of ref_audio segments in tokens,
+    # and each entry in cond_audio_latents corresponds to one audio segment.
+    audio_seg_count = sum(1 for k in seg_kinds if k == "ref_audio")
+    assert audio_seg_count == len(ca)

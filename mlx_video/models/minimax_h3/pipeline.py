@@ -337,6 +337,7 @@ class H3Pipeline:
         ref_image_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
         ref_video_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
         ref_audio_latents: Optional[List[mx.array]] = None,   # v17: multi-ref
+        ref_video_audios: Optional[List[Optional[mx.array]]] = None,  # v17 sub5: paired audio per ref video (len must match ref_video_latents; None entries = no paired audio for that video)
         verbose: bool = True,
         # Phase 8.11-3 diagnostic: dump the DiT-produced latent (post-denoise,
         # pre-VAE-decode) to this path as an npy file. Use with the
@@ -414,13 +415,40 @@ class H3Pipeline:
             _, _, _, rh, rw = zi.shape
             refs.append(RefBlock(kind="image", latent_h=rh, latent_w=rw))
             cond_video_latents.append(zi)
-        # (b) videos (kind=video, no paired audio for now -- paired video_audio
-        #     RefBlock is Phase C sub 5).
-        for zv in vid_latents_l:
-            # shape: [1, 24, vt, h, w]
+        # (b) videos. If ref_video_audios[i] is a latent, that ref becomes
+        #     kind='video_audio' -- the paired audio latent is prepended into
+        #     cond_audio_latents at this position so the PackedLayout audio
+        #     row block right before the video image rows is fed the right
+        #     latent (sub 5 -- lip-sync driver).
+        if ref_video_audios is not None:
+            if len(ref_video_audios) != len(vid_latents_l):
+                raise ValueError(
+                    f"ref_video_audios length {len(ref_video_audios)} must match "
+                    f"ref_video_latents length {len(vid_latents_l)} (use None for "
+                    f"videos without paired audio)"
+                )
+        else:
+            ref_video_audios = [None] * len(vid_latents_l)
+
+        for zv, zva in zip(vid_latents_l, ref_video_audios):
+            # video latent shape: [1, 24, vt, h, w]
             _, _, vt, rh, rw = zv.shape
-            refs.append(RefBlock(kind="video", latent_h=rh, latent_w=rw, latent_t=vt))
-            cond_video_latents.append(zv)
+            if zva is not None:
+                # audio latent shape: [1, 32, 2, T]
+                rat = zva.shape[-1]
+                refs.append(RefBlock(kind="video_audio",
+                                     latent_h=rh, latent_w=rw, latent_t=vt,
+                                     ref_audio_t=rat))
+                cond_video_latents.append(zv)
+                # Paired audio precedes the video in the packed layout's
+                # audio_pos; must be appended here (before any independent
+                # audios) so cond_audio_latents lines up with audio_pos row-
+                # for-row.
+                cond_audio_latents.append(zva)
+            else:
+                refs.append(RefBlock(kind="video",
+                                     latent_h=rh, latent_w=rw, latent_t=vt))
+                cond_video_latents.append(zv)
         # (c) independent audios
         for za in aud_latents_l:
             # shape: [1, 32, 2, T]
@@ -437,6 +465,7 @@ class H3Pipeline:
             "images": len(img_latents_l),
             "videos": len(vid_latents_l),
             "audios": len(aud_latents_l),
+            "paired_video_audios": sum(1 for za in ref_video_audios if za is not None),
         }
 
         # Cache layout across steps
