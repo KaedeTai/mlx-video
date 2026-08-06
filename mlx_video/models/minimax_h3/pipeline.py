@@ -122,18 +122,54 @@ class H3Pipeline:
             print(f"[adaln-cache] building for {timesteps.shape[0]} unique timesteps "
                   f"(visual_cond={has_visual_cond}, audio_cond={has_audio_cond})...")
         t0 = _time.time()
-        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.bfloat16, key_values=keys)
+        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.float32, key_values=keys)
         # Attach BEFORE dropping so a botched drop still leaves an intact model behind a cache.
         self.dit._modulation_cache = cache
         build_s = _time.time() - t0
         if verbose:
             print(f"[adaln-cache] built in {build_s:.1f}s, size {cache.nbytes()/1e6:.1f} MB")
+
+        # ---- Bitwise verify (v15 260807 Fix 5): confirm the cache rows match a live
+        # ``adaln_proj`` call before we drop the weights. If diverged, DO NOT drop.
+        try:
+            sanity_key = keys[0]
+            sanity_t = timesteps[0:1]
+            t_emb_single = self.dit.time_embedder(sanity_t)
+            live_mod = self.dit.blocks[0].adaln_proj(t_emb_single)  # tuple of 6 [3, hidden]
+            cached_mod = cache.gather(0, [sanity_key])  # tuple of 6 [3, hidden]
+            diffs = []
+            for lv, cv in zip(live_mod, cached_mod):
+                d = float(mx.max(mx.abs(lv.astype(mx.float32) - cv.astype(mx.float32))).item())
+                diffs.append(d)
+            max_diff = max(diffs)
+            if verbose:
+                print(f"[adaln-cache] BITWISE verify block0 step {sanity_key}: "
+                      f"max|live - cached| = {max_diff:.3e} (per-tuple {diffs})")
+            if max_diff >= 1e-5:
+                raise RuntimeError(
+                    f"[adaln-cache] BITWISE verify FAILED: max diff {max_diff:.3e} >= 1e-5. "
+                    "Refusing to drop adaln weights — cache is not equivalent to live forward."
+                )
+        except Exception as e:
+            if "BITWISE verify FAILED" in str(e):
+                raise
+            # Non-fatal diagnostic error — log and proceed.
+            if verbose:
+                print(f"[adaln-cache] BITWISE verify skipped: {e!r}")
+
         t0 = _time.time()
         freed = drop_adaln_weights(self.dit, drop_final=True)
         drop_s = _time.time() - t0
         if verbose:
             print(f"[adaln-cache] dropped adaln_proj weights, freed {freed/1e9:.2f} GB "
                   f"in {drop_s:.1f}s")
+        # Fix 4: sanity assertion — dropping the 50-block adaln bank should free >=20 GB
+        # (bf16 in mlx-video: ~26 GB; Q4/Q8: less but still large). If well under, the
+        # drop path missed arrays and we should not silently proceed.
+        assert freed >= 20 * 1024**3, (
+            f"[adaln-cache] freed only {freed/1e9:.2f} GB, expected >=20 GB "
+            "— drop path likely missed base/LoRA arrays"
+        )
         return cache
 
     def enable_layer_group_eviction(self, group_size: int = 10, verbose: bool = True):

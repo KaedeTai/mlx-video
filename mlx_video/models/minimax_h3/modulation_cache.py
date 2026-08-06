@@ -14,8 +14,14 @@ In mlx-video's HEAVY_SUFFIX Q4 build the ``adaln_proj.linear`` weights are delib
 in bf16 (they are excluded from ``HEAVY_SUFFIX`` in ``scripts/h3/quantize_dit.py``). That means
 each 50-block adaln bank is ~26 GB in RAM. Precomputing the modulation from those bf16
 projections into a ~387 MB lookup table (for a 4-step schedule) then dropping the weights
-yields the same ~67x reduction the pipenetwork build reports while preserving voice quality
-(pipenetwork quantized adaln to Q4 in a later revision — we keep bf16 precision by design).
+yields the same ~67x reduction the pipenetwork build reports while preserving voice quality.
+
+Note on pipenetwork adaln quantization
+---------------------------------------
+``~/models/MiniMax-H3-4bit/quant_config.json`` sets ``adaln_bits=8`` (with ``quantize_adaln:true``),
+so pipenetwork keeps the adaln projections at **Q8**, not Q4. mlx-video's HEAVY_SUFFIX Q4 build
+leaves adaln at **bf16** for maximum precision; the cache is stored in **fp32** by default so
+repeated downcast noise (bf16 → fp32 → bf16) does not accumulate across 4-step denoising.
 
 mlx-video specifics
 -------------------
@@ -264,7 +270,7 @@ class ModulationCache:
         dit,
         timesteps: mx.array,
         *,
-        dtype: mx.Dtype = mx.bfloat16,
+        dtype: mx.Dtype = mx.float32,
         cache_final: bool = True,
         key_values: Optional[Sequence[float]] = None,
     ) -> "ModulationCache":
@@ -275,27 +281,53 @@ class ModulationCache:
                 for a HEAVY_SUFFIX Q4 build).
             timesteps: ``(T,)`` float32 sorted-ascending union of distinct unique-t values,
                 typically the output of :func:`schedule_timesteps`.
-            dtype: storage dtype of the cache. bf16 halves the footprint and matches the
-                precision the modulation is consumed at inside the block stack.
+            dtype: storage dtype of the cache. Defaults to fp32 to preserve voice-critical
+                precision — mlx-video's pipeline runs context/t_emb/AdaLN in fp32; downcasting
+                to bf16 introduced measurable MFCC drift in voice A/B tests (see v15 260807).
             cache_final: also cache ``final_layer.adaln_proj`` (default True).
         """
         # ``TimeEmbedder`` expects ``t: [M]`` float in [0, 1] and returns ``[M, time_embed_dim]``
         # (fp32). Cast to the AdalnProj linear's weight dtype implicitly via the linear call —
         # AdalnProj already handles that ``.astype(...)`` internally.
-        t_emb = dit.time_embedder(timesteps)
-        mx.eval(t_emb)
+        #
+        # Per-step-per-block build (Fix 3, v15 260807): calling ``adaln_proj`` once with a
+        # ``[T_all, hidden]`` batch selects a batched GEMM kernel, whereas the live forward
+        # feeds ``[k, hidden]`` where ``k = len(unique_t)`` for the current step (typically
+        # 1..4). Building per-step matches the live kernel path so the cached rows are
+        # bitwise-equivalent (verified in ``build_adaln_cache_and_drop``).
+        T_all = int(timesteps.shape[0])
 
         tables: List[Tuple[mx.array, ...]] = []
         for block in dit.blocks:
-            table = tuple(a.astype(dtype) for a in block.adaln_proj(t_emb))
+            step_outs: List[Tuple[mx.array, ...]] = []
+            for i in range(T_all):
+                t_single = timesteps[i:i + 1]
+                t_emb_single = dit.time_embedder(t_single)
+                out = tuple(a.astype(dtype) for a in block.adaln_proj(t_emb_single))
+                mx.eval(out)
+                step_outs.append(out)
+            # Concatenate step outputs along row axis: 6 arrays of [T_all * modalities, hidden]
+            table = tuple(
+                mx.concatenate([step_outs[i][j] for i in range(T_all)], axis=0)
+                for j in range(len(step_outs[0]))
+            )
             mx.eval(table)
             tables.append(table)
 
         final_table: Optional[Tuple[mx.array, mx.array]] = None
         if cache_final:
-            final = tuple(a.astype(dtype) for a in dit.final_layer.adaln_proj(t_emb))
-            mx.eval(final)
-            final_table = final
+            step_finals: List[Tuple[mx.array, ...]] = []
+            for i in range(T_all):
+                t_single = timesteps[i:i + 1]
+                t_emb_single = dit.time_embedder(t_single)
+                out = tuple(a.astype(dtype) for a in dit.final_layer.adaln_proj(t_emb_single))
+                mx.eval(out)
+                step_finals.append(out)
+            final_table = tuple(
+                mx.concatenate([step_finals[i][j] for i in range(T_all)], axis=0)
+                for j in range(len(step_finals[0]))
+            )
+            mx.eval(final_table)
 
         return cls(tables, timesteps, final_table=final_table, key_values=key_values)
 
