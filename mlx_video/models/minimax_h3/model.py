@@ -390,6 +390,14 @@ class MiniMaxH3Model(nn.Module):
             step_index = None
 
         # ---- 50 DiT blocks (optionally group-evicted) ----
+        # v16 260807 Sub3: materialization barriers. In lazy MLX the block outputs
+        # cascade as an unrealised graph until the final ``mx.eval`` at the end of
+        # the step; the arena keeps every intermediate array live until then, which
+        # inflates peak Metal memory. Force a materialise every ``eval_every`` blocks
+        # so the arena can drop older activations. Default 10 matches the layer-group
+        # size; caller can override via ``dit._eval_every`` (set from the CLI or
+        # pipeline) with 0 disabling barriers.
+        eval_every = int(getattr(self, "_eval_every", 10))
         mgr = getattr(self, "_layer_mgr", None)
         if mgr is not None:
             for gi in range(mgr.num_groups):
@@ -407,6 +415,8 @@ class MiniMaxH3Model(nn.Module):
             for i, block in enumerate(self.blocks):
                 h = block(h, t_emb, mod_segments, rope_table,
                           modulation=per_block_mod[i])
+                if eval_every > 0 and ((i + 1) % eval_every == 0):
+                    mx.eval(h)
 
         # ---- Final layer: split video / audio slices ----
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")

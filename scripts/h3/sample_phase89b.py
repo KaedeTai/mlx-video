@@ -215,6 +215,12 @@ def main():
                     help="If >0, enable LayerGroupManager on the DiT blocks. "
                          "Weights of dormant groups live in CPU RAM (not Metal-wired), "
                          "trading ~+30-40 ms/step for a lower peak Metal working set.")
+    ap.add_argument("--eval-every", type=int, default=10,
+                    help="v16 Sub3 materialisation barrier: mx.eval(h) every N DiT "
+                         "blocks in the forward loop. 0 disables. Default 10. Lets "
+                         "the arena drop older activations mid-step to cap peak Metal. "
+                         "Ignored when --layer-group-size > 0 (group-eviction already "
+                         "materialises at group boundaries).")
     args = ap.parse_args()
 
     _log(f"mem(start): {_mem_snapshot()}")
@@ -305,6 +311,11 @@ def main():
              f"{cache.nbytes()/1e6:.1f} MB lookup table")
         _log(f"active_mlx {active_before:.2f} GiB -> {active_after:.2f} GiB "
              f"in {time.time()-t_c:.1f}s, {_mem_snapshot()}")
+
+    # v16 260807 Sub3: install materialisation-barrier cadence on the DiT.
+    pipe.dit._eval_every = int(args.eval_every)
+    _log(f"materialisation barrier: mx.eval(h) every {args.eval_every} blocks "
+         f"({'disabled' if args.eval_every == 0 else 'enabled'})")
 
     if args.layer_group_size > 0:
         _log(f"enabling LayerGroupManager (group_size={args.layer_group_size})")
