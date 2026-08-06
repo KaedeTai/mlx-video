@@ -8,3 +8,7 @@ config.json
 **.pyc
 __pycache__/*
 *.egg-info/*
+# Historical backups from H3 v15/v16 refactor passes -- keep on-disk for diffs
+# but never commit.
+*.bak
+*.bak_pre_*

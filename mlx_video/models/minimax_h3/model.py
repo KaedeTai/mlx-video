@@ -357,17 +357,37 @@ class MiniMaxH3Model(nn.Module):
         inv_freq_np = np.asarray(self.rope.inv_freq).astype(np.float32)
         rope_table = build_rope_table(layout.position_ids, inv_freq_np, dtype=compute_dtype)
 
-        # ---- ModulationCache lookup (optional; v15) ----
+        # ---- ModulationCache lookup (v16 -- step-indexed) ----
         # When a cache is attached the per-block ``adaln_proj`` weights have been dropped;
-        # per-step modulation is gathered from the precomputed union-of-timesteps table.
+        # per-step modulation is looked up by the sampler's integer step index (which
+        # the pipeline pokes into ``payload["step_index"]`` every step). No float-hash
+        # indirection -- the cache is a pure ``list[step][block]`` lookup, so runs at
+        # non-Turbo step counts (30/50/100) now cache-hit exactly the way 4-step Turbo
+        # already did in v15.
         cache = getattr(self, "_modulation_cache", None)
         if cache is not None:
+            step_index = payload.get("step_index")
+            if step_index is None:
+                raise RuntimeError(
+                    "[adaln-cache] a ModulationCache is attached to the DiT but "
+                    "payload['step_index'] was not set -- the caller must set it "
+                    "to the integer sampler step index before every DiT call."
+                )
+            step_index = int(step_index)
+            # v16 260807 safety: refuse to modulate outside the cached step range.
+            if step_index < 0 or step_index >= cache.num_steps:
+                raise RuntimeError(
+                    f"[adaln-cache] step_index={step_index} out of cache range "
+                    f"[0, {cache.num_steps}) -- schedule likely changed after cache "
+                    f"was built"
+                )
             # Pre-materialize per-block modulation tuples so we don't re-gather inside a
             # ``LayerGroupManager.active_group`` context (which is orthogonal to the cache).
-            per_block_mod = [cache.gather(i, unique_t) for i in range(len(self.blocks))]
+            per_block_mod = [cache.gather(i, step_index) for i in range(len(self.blocks))]
             mx.eval(*[a for tup in per_block_mod for a in tup])
         else:
             per_block_mod = [None] * len(self.blocks)
+            step_index = None
 
         # ---- 50 DiT blocks (optionally group-evicted) ----
         mgr = getattr(self, "_layer_mgr", None)
@@ -391,7 +411,11 @@ class MiniMaxH3Model(nn.Module):
         # ---- Final layer: split video / audio slices ----
         video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
-        final_mod = cache.final_layer_gather(unique_t) if (cache is not None and cache.final_table is not None) else None
+        final_mod = (
+            cache.final_layer_gather(step_index)
+            if (cache is not None and cache.per_step_final is not None)
+            else None
+        )
         v_out, a_out = self.final_layer(h, t_emb, video_seg, audio_seg, modulation=final_mod)
 
         # ---- Unpatchify + trim to orig ----

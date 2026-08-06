@@ -96,31 +96,33 @@ class H3Pipeline:
         *,
         has_visual_cond: bool,
         has_audio_cond: bool,
+        layout: Optional[Any] = None,
+        model_hash: str = "unknown",
+        lora_hash: Optional[str] = None,
+        tag: str = "",
         verbose: bool = True,
     ):
-        """Precompute per-block AdaLN modulation, then drop the ``adaln_proj`` weights.
+        """Precompute per-block AdaLN modulation (step-indexed, v16) then drop weights.
 
         Rationale + design in ``modulation_cache.py``. Must be called AFTER any Turbo LoRA
         overlay (LoRA does not touch ``adaln_proj`` in this build, so this is only about
         the ordering of memory events) and BEFORE ``enable_layer_group_eviction`` so the
         eviction snapshot never captures the dropped adaln parameters.
+
+        The optional ``layout`` argument lets the caller commit a specific
+        :class:`PackedLayout` to the cache signature so it fails-closed when
+        replayed against a differently-shaped run. Pass the same layout the
+        upcoming ``generate()`` call will use.
         """
         import time as _time
         from .modulation_cache import (
-            ModulationCache, drop_adaln_weights, schedule_timesteps_with_keys,
-            per_step_unique_t, verify_cache_bitwise,
+            ModulationCache, DEFAULT_SCHEDULE_NAME, DropRefused,
+            _live_signature_from_pipeline, drop_adaln_weights,
+            hash_layout, per_step_unique_t, verify_cache_bitwise,
         )
         # Populate scheduler.sigmas so we know the union of unique-t values.
         self.scheduler.set_timesteps(num_steps)
         sigmas_list = self.scheduler.sigmas.tolist()
-        keys, timesteps = schedule_timesteps_with_keys(
-            sigmas_list,
-            has_visual_cond=has_visual_cond,
-            has_audio_cond=has_audio_cond,
-            shift_video=self.scheduler.shift_video,
-            shift_audio=self.scheduler.shift_audio,
-        )
-        # Per-step unique_t (mirrors what MiniMaxH3Model.__call__ computes each step)
         step_ut = per_step_unique_t(
             sigmas_list,
             has_visual_cond=has_visual_cond,
@@ -130,11 +132,33 @@ class H3Pipeline:
         )
         if verbose:
             m_hist = [len(x) for x in step_ut]
-            print(f"[adaln-cache] building for {timesteps.shape[0]} unique timesteps, "
+            print(f"[adaln-cache] v16 step-indexed build: "
                   f"{len(step_ut)} steps M={m_hist} "
                   f"(visual_cond={has_visual_cond}, audio_cond={has_audio_cond})...")
+
+        layout_hash = hash_layout(layout) if layout is not None else "unbound"
+        signature = _live_signature_from_pipeline(
+            num_steps=num_steps,
+            num_blocks=len(self.dit.blocks),
+            has_visual_cond=has_visual_cond,
+            has_audio_cond=has_audio_cond,
+            shift_video=self.scheduler.shift_video,
+            shift_audio=self.scheduler.shift_audio,
+            sigma_min=1e-5,
+            schedule_name=DEFAULT_SCHEDULE_NAME,
+            dtype="float32",
+            use_adaln_curves=bool(getattr(self.dit, "use_adaln_curves", False)),
+            cache_final=True,
+            model_hash=model_hash,
+            lora_hash=lora_hash,
+            layout_hash=layout_hash,
+            per_step_ut=step_ut,
+            tag=tag,
+        )
         t0 = _time.time()
-        cache = ModulationCache.build(self.dit, timesteps, dtype=mx.float32, key_values=keys, per_step_ut=step_ut)
+        cache = ModulationCache.build(
+            self.dit, step_ut, signature, dtype=mx.float32, cache_final=True,
+        )
         # Attach BEFORE dropping so a botched drop still leaves an intact model behind a cache.
         self.dit._modulation_cache = cache
         build_s = _time.time() - t0
@@ -142,23 +166,35 @@ class H3Pipeline:
             print(f"[adaln-cache] built in {build_s:.1f}s, "
                   f"size {cache.nbytes()/1024**2:.1f} MiB")
 
-        # ---- v15 260807 bugfix #1/#2: RIGOROUS bitwise verify across every block,
-        # every step, every tuple + NaN/Inf sweep. FAIL-CLOSED: any exception raises
-        # and blocks the drop. Do NOT swallow verify errors -- a "skipped" verify
-        # followed by a weight drop leaves the model silently broken.
-        verify_cache_bitwise(
-            cache, self.dit, step_ut,
-            verify_final=cache.final_table is not None,
+        # ---- v16 260807: bitwise verify then fail-closed drop. On any refusal the
+        # cache stays attached and the ``adaln_proj`` weights are NOT dropped, so
+        # the model still runs via its legacy path if the caller catches DropRefused.
+        _n_checks, max_diff = verify_cache_bitwise(
+            cache, self.dit,
+            verify_final=cache.per_step_final is not None,
             verbose=verbose,
         )
+        if max_diff != 0.0:
+            # 30-step live-vs-cache diff != 0 -- log and refuse.
+            print(f"[adaln-cache] REFUSING DROP: live-vs-cache max_diff={max_diff:.6e}")
+            return cache
 
         t0 = _time.time()
-        freed = drop_adaln_weights(self.dit, drop_final=True)
+        try:
+            freed = drop_adaln_weights(
+                self.dit, cache,
+                live_signature=signature, drop_final=True,
+                verify_diff=max_diff, verbose=verbose,
+            )
+        except DropRefused as exc:
+            print(f"[adaln-cache] {exc} -- keeping legacy adaln_proj weights, "
+                  f"cache still attached")
+            return cache
         drop_s = _time.time() - t0
         if verbose:
             print(f"[adaln-cache] dropped adaln_proj weights, "
                   f"freed {freed/1024**3:.2f} GiB in {drop_s:.1f}s")
-        # Fix 4: sanity assertion -- dropping the 50-block adaln bank should free >=20 GiB
+        # Sanity assertion -- dropping the 50-block adaln bank should free >=20 GiB
         # (bf16 in mlx-video: ~26 GiB; Q4/Q8: less but still large). If well under, the
         # drop path missed arrays and we should not silently proceed.
         assert freed >= 20 * 1024**3, (
@@ -166,6 +202,12 @@ class H3Pipeline:
             "-- drop path likely missed base/LoRA arrays"
         )
         return cache
+
+    def reset_adaln_cache(self):
+        """Detach any attached ModulationCache. Call at ``generate()`` start when
+        the schedule / conditioning may have changed between runs."""
+        if getattr(self.dit, "_modulation_cache", None) is not None:
+            self.dit._modulation_cache = None
 
     def enable_layer_group_eviction(self, group_size: int = 10, verbose: bool = True):
         """Install a LayerGroupManager on ``self.dit``.
@@ -286,9 +328,36 @@ class H3Pipeline:
         if verbose:
             print(f"[H3] packed seq_len={layout.seq_len}")
 
+        # v16 260807: fail-closed if an attached ModulationCache disagrees with the
+        # run about num_steps / conditioning / schedule. Refuse to launch rather
+        # than silently produce a garbage output.
+        cache = getattr(self.dit, "_modulation_cache", None)
+        if cache is not None:
+            sig = cache.signature
+            problems = []
+            if sig.num_steps != num_steps:
+                problems.append(f"num_steps mismatch: cache={sig.num_steps} run={num_steps}")
+            has_vis = bool(cond_video_latents)
+            has_aud = bool(cond_audio_latents)
+            if sig.has_visual_cond != has_vis:
+                problems.append(f"has_visual_cond mismatch: cache={sig.has_visual_cond} run={has_vis}")
+            if sig.has_audio_cond != has_aud:
+                problems.append(f"has_audio_cond mismatch: cache={sig.has_audio_cond} run={has_aud}")
+            if sig.num_blocks != len(self.dit.blocks):
+                problems.append(f"num_blocks mismatch: cache={sig.num_blocks} run={len(self.dit.blocks)}")
+            if problems:
+                raise RuntimeError(
+                    "[adaln-cache] cache signature disagrees with run; refusing: "
+                    + "; ".join(problems)
+                    + " -- call pipe.reset_adaln_cache() and rebuild for this run"
+                )
+
         # ------- 5) Denoise loop -------
         for i in range(num_steps):
             step_t0 = _time.time()
+            # v16 260807: step-indexed cache lookup. The DiT reads this to index the
+            # ModulationCache; it also serves as a canonical run-position marker.
+            payload["step_index"] = i
             ts = self.scheduler.timestep_for(i)
             v_video, v_audio = self.dit(
                 (video_latent, audio_latent), ts, context, payload=payload,
