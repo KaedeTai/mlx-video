@@ -344,6 +344,16 @@ class H3Pipeline:
         # scripts/h3/analyze_dit_latent.py FFT tool to check whether the
         # 16-px spatial grid is already present upstream of the VAE.
         dump_latent_path: Optional[str] = None,
+        # v18 260807 debug: if set, dump per-step DiT-produced latents (video +
+        # audio) along with the per-step sigma to this .npz path. Splits the
+        # DiT vs VAE responsibility question: if latents here look sane but
+        # decoded output looks bad, the VAE is at fault.
+        # Format:
+        #   video_steps: (num_steps+1, C, T, H, W)  (index 0 = init noise, index k = after step k)
+        #   audio_steps: (num_steps+1, C, 2, T)
+        #   sigmas:     (num_steps,) float32
+        #   timesteps:  (num_steps,) float32
+        dump_latent_steps_path: Optional[str] = None,
         # Phase 8.9-b: pre-computed text conditioning. If provided, the
         # attached ``text_encoder`` is NOT called — this lets the caller run
         # ``H3TextEncoderBridge.encode(...)`` in a separate stage, free the
@@ -530,6 +540,17 @@ class H3Pipeline:
         if _evict_v_vae:
             self._evict_component("video_vae", verbose=verbose)
 
+        # v18 260807 debug: accumulate per-step latents if opted in.
+        _dump_steps = dump_latent_steps_path is not None
+        _v_steps: list = []
+        _a_steps: list = []
+        _sigmas: list = []
+        _timesteps: list = []
+        if _dump_steps:
+            # index 0 = pre-step-0 initial (scaled) noise
+            _v_steps.append(np.asarray(video_latent.astype(mx.float32)).copy())
+            _a_steps.append(np.asarray(audio_latent.astype(mx.float32)).copy())
+
         # ------- 5) Denoise loop -------
         for i in range(num_steps):
             step_t0 = _time.time()
@@ -545,10 +566,39 @@ class H3Pipeline:
                 v_video, v_audio, i, video_latent, audio_latent,
             )
             mx.eval(video_latent, audio_latent)
+            if _dump_steps:
+                _v_steps.append(np.asarray(video_latent.astype(mx.float32)).copy())
+                _a_steps.append(np.asarray(audio_latent.astype(mx.float32)).copy())
+                _sigmas.append(float(self.scheduler.sigmas[i]))
+                try:
+                    _timesteps.append(float(np.asarray(ts).reshape(-1)[0]))
+                except Exception:
+                    _timesteps.append(float("nan"))
             if verbose:
                 sigma = float(self.scheduler.sigmas[i])
                 print(f"[H3] step {i+1}/{num_steps}: sigma={sigma:.4f}, "
                       f"step={_time.time()-step_t0:.1f}s")
+
+        # v18 260807 debug: write per-step latent dump before optional evict.
+        if _dump_steps:
+            from pathlib import Path as _Path
+            _dp = _Path(dump_latent_steps_path).expanduser()
+            _dp.parent.mkdir(parents=True, exist_ok=True)
+            _v_arr = np.stack(_v_steps, axis=0)
+            _a_arr = np.stack(_a_steps, axis=0)
+            _s_arr = np.asarray(_sigmas, dtype=np.float32)
+            _t_arr = np.asarray(_timesteps, dtype=np.float32)
+            np.savez_compressed(
+                str(_dp),
+                video_steps=_v_arr,
+                audio_steps=_a_arr,
+                sigmas=_s_arr,
+                timesteps=_t_arr,
+            )
+            if verbose:
+                print(f"[H3] v18 dumped per-step latents to {_dp}  "
+                      f"(video_steps={_v_arr.shape}, audio_steps={_a_arr.shape}, "
+                      f"sigmas={_s_arr.shape})")
 
         # ------- 5.5) Optional: dump DiT-produced latent for FFT diagnostics -------
         if dump_latent_path is not None:

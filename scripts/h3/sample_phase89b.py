@@ -119,6 +119,71 @@ def _mem_snapshot() -> str:
 _peak_rss_gb = _peak_rss_gib
 
 
+# ---------------------------------------------------------------------------
+# v18 260807 --verbose-memory helpers
+# ---------------------------------------------------------------------------
+
+def _vm_pages_snapshot() -> dict:
+    """Return {free_pages, active_pages, wired_pages, inactive_pages, page_size}."""
+    snap = {"free": 0, "active": 0, "wired": 0, "inactive": 0,
+            "page_size": _vm_page_size()}
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                             check=True).stdout
+    except Exception:
+        return snap
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Pages free:"):
+            snap["free"] = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+        elif line.startswith("Pages active:"):
+            snap["active"] = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+        elif line.startswith("Pages wired down:"):
+            snap["wired"] = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+        elif line.startswith("Pages inactive:"):
+            snap["inactive"] = int(line.rsplit(":", 1)[1].strip().rstrip("."))
+    return snap
+
+
+def _fmt_pages_mb(pages: int, page_size: int) -> float:
+    return pages * page_size / (1024**2)
+
+
+class _StageTimer:
+    """Context manager: log vm_stat snapshot + delta around a stage."""
+
+    def __init__(self, name: str, enabled: bool):
+        self.name = name
+        self.enabled = enabled
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self.t0 = time.time()
+        self.snap0 = _vm_pages_snapshot()
+        ps = self.snap0["page_size"]
+        _log(f"[vm-stat/BEGIN {self.name}] "
+             f"free={_fmt_pages_mb(self.snap0['free'], ps):.1f} MB, "
+             f"active={_fmt_pages_mb(self.snap0['active'], ps):.1f} MB, "
+             f"wired={_fmt_pages_mb(self.snap0['wired'], ps):.1f} MB")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.enabled:
+            return False
+        snap1 = _vm_pages_snapshot()
+        ps = snap1["page_size"]
+        dt = time.time() - self.t0
+        d_free = _fmt_pages_mb(snap1["free"] - self.snap0["free"], ps)
+        d_active = _fmt_pages_mb(snap1["active"] - self.snap0["active"], ps)
+        d_wired = _fmt_pages_mb(snap1["wired"] - self.snap0["wired"], ps)
+        _log(f"[vm-stat/END   {self.name}] took={dt:.2f}s, "
+             f"free={_fmt_pages_mb(snap1['free'], ps):.1f} MB (d={d_free:+.1f}), "
+             f"active={_fmt_pages_mb(snap1['active'], ps):.1f} MB (d={d_active:+.1f}), "
+             f"wired={_fmt_pages_mb(snap1['wired'], ps):.1f} MB (d={d_wired:+.1f})")
+        return False
+
+
 def _run_ffmpeg(video_rgb: np.ndarray, audio_stereo: np.ndarray,
                 fps: int, sample_rate: int, out_path: Path):
     out_path = out_path.expanduser().resolve()
@@ -242,6 +307,19 @@ def main():
                          "the arena drop older activations mid-step to cap peak Metal. "
                          "Ignored when --layer-group-size > 0 (group-eviction already "
                          "materialises at group boundaries).")
+    # v18 260807 debug flags -----------------------------------------------
+    ap.add_argument("--dump-latent", default=None,
+                    help="v18 debug: dump per-step DiT-produced latents (video + "
+                         "audio) and per-step sigma / timestep to this .npz path. "
+                         "Use to split DiT vs VAE responsibility when output looks bad.")
+    ap.add_argument("--dump-ref-info", default=None,
+                    help="v18 debug: after ref encoding, dump per-ref metadata "
+                         "(kind, path, input shape, latent shape, latent stats, "
+                         "packed slot, text marker) to this .json path.")
+    ap.add_argument("--verbose-memory", action="store_true",
+                    help="v18 debug: print vm_stat snapshot + delta around each "
+                         "major stage (ref encoding, DiT sampling, video decode, "
+                         "audio decode, mux). Complements existing per-stage logs.")
     args = ap.parse_args()
 
     _log(f"mem(start): {_mem_snapshot()}")
@@ -420,93 +498,196 @@ def main():
     # ---------- Stage 3: refs (image + audio) ----------
     import mlx.core as mx
 
-    # v17 multiref: encode every image ref into ref_image_latents list.
-    ref_image_latents = []
-    if ref_image_paths:
-        from PIL import Image
-        for idx, rp in enumerate(ref_image_paths):
-            img = Image.open(rp).convert("RGB").resize(
-                (args.width, args.height), Image.LANCZOS)
-            arr = np.asarray(img, dtype=np.float32) / 255.0
-            arr = arr * 2.0 - 1.0
-            arr = arr.transpose(2, 0, 1)[None, :, None, :, :]
-            ref_x = mx.array(arr)
-            zi = pipe.video_vae.encode(ref_x)
-            ref_image_latents.append(zi)
-            _log(f"ref_image_latents[{idx}] ({rp.name}) shape: {zi.shape}")
-    ref_image_latent = ref_image_latents[0] if ref_image_latents else None
+    # v18 260807 debug: collect per-ref metadata for --dump-ref-info.
+    ref_info_entries: list = []
 
-    ref_video_latents = []
-    if ref_video_paths:
-        import subprocess
-        for idx, rvp in enumerate(ref_video_paths):
-            # Decode video to raw rgb24 via ffmpeg.
-            proc = subprocess.run(
-                ["ffprobe","-v","error","-select_streams","v:0",
-                 "-show_entries","stream=width,height,nb_frames,r_frame_rate",
-                 "-of","default=nw=1:nk=1", str(rvp)],
-                capture_output=True, text=True, check=True)
-            pw, ph, nfr, rfr = proc.stdout.strip().split("\n")[:4]
-            pw, ph = int(pw), int(ph)
-            _log(f"ref_video[{idx}] probe ({rvp.name}): {pw}x{ph}, "
-                 f"nb_frames={nfr}, fps={rfr}")
-            rw = (pw // 16) * 16
-            rh = (ph // 16) * 16
-            raw = subprocess.run(
-                ["ffmpeg","-loglevel","error","-i",str(rvp),
-                 "-vf",f"scale={rw}:{rh},fps=24","-vframes","17",
-                 "-pix_fmt","rgb24","-f","rawvideo","-"],
-                capture_output=True, check=True).stdout
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, rh, rw, 3)
-            _log(f"ref_video[{idx}] decoded frames={arr.shape[0]} at {rh}x{rw}")
-            T = 17
-            if arr.shape[0] < T:
-                arr = np.concatenate(
-                    [arr, np.repeat(arr[-1:], T - arr.shape[0], axis=0)], axis=0)
-            else:
-                arr = arr[:T]
-            arr_f = arr.astype(np.float32) / 255.0
-            arr_f = arr_f * 2.0 - 1.0
-            arr_f = arr_f.transpose(3, 0, 1, 2)[None]
-            ref_v_x = mx.array(arr_f)
-            zv = pipe.video_vae.encode(ref_v_x)
-            ref_video_latents.append(zv)
-            _log(f"ref_video_latents[{idx}] shape: {zv.shape}")
-    ref_video_latent = ref_video_latents[0] if ref_video_latents else None
+    def _lat_stats(z):
+        try:
+            zn = np.asarray(z.astype(mx.float32))
+            return {"mean": float(zn.mean()), "std": float(zn.std()),
+                    "min": float(zn.min()), "max": float(zn.max())}
+        except Exception as e:
+            return {"error": repr(e)}
 
-    ref_audio_latents = []
-    if ref_audio_paths:
-        from scipy.io import wavfile
-        for idx, rap in enumerate(ref_audio_paths):
-            sr, wav = wavfile.read(rap)
-            if wav.ndim == 1:
-                wav = np.stack([wav, wav], axis=-1)
-            wav = wav.astype(np.float32) / 32768.0
-            wav_mx = mx.array(wav.T[None, ...])
-            za = pipe.audio_vae.encode(wav_mx)
-            ref_audio_latents.append(za)
-            _log(f"ref_audio_latents[{idx}] ({rap.name}) shape: {za.shape}")
-    ref_audio_latent = ref_audio_latents[0] if ref_audio_latents else None
+    with _StageTimer("ref-encoding", args.verbose_memory):
+        # v17 multiref: encode every image ref into ref_image_latents list.
+        ref_image_latents = []
+        if ref_image_paths:
+            from PIL import Image
+            for idx, rp in enumerate(ref_image_paths):
+                img = Image.open(rp).convert("RGB").resize(
+                    (args.width, args.height), Image.LANCZOS)
+                arr = np.asarray(img, dtype=np.float32) / 255.0
+                arr = arr * 2.0 - 1.0
+                arr = arr.transpose(2, 0, 1)[None, :, None, :, :]
+                ref_x = mx.array(arr)
+                zi = pipe.video_vae.encode(ref_x)
+                ref_image_latents.append(zi)
+                _log(f"ref_image_latents[{idx}] ({rp.name}) shape: {zi.shape}")
+                if args.dump_ref_info:
+                    ref_info_entries.append({
+                        "ref_type": "image",
+                        "index_within_type": idx,
+                        "path": str(rp),
+                        "input_shape": list(arr.shape),
+                        "latent_shape": list(zi.shape),
+                        "latent_stats": _lat_stats(zi),
+                        "text_marker": f"<Picture {idx+1}>:",
+                    })
+        ref_image_latent = ref_image_latents[0] if ref_image_latents else None
 
-    # Sub 5: paired ref-video-audio -> list[Optional[mx.array]] aligned with
-    # ref_video_paths. Same audio_vae; use 'none' entries to keep kind='video'
-    # for that slot.
-    ref_video_audio_latents: list = []
-    if ref_video_paths:
-        from scipy.io import wavfile
-        for idx, rvap in enumerate(ref_video_audio_paths):
-            if rvap is None:
-                ref_video_audio_latents.append(None)
-                continue
-            sr, wav = wavfile.read(rvap)
-            if wav.ndim == 1:
-                wav = np.stack([wav, wav], axis=-1)
-            wav = wav.astype(np.float32) / 32768.0
-            wav_mx = mx.array(wav.T[None, ...])
-            zva = pipe.audio_vae.encode(wav_mx)
-            ref_video_audio_latents.append(zva)
-            _log(f"ref_video_audio_latents[{idx}] paired with "
-                 f"{ref_video_paths[idx].name} ({rvap.name}) shape: {zva.shape}")
+        ref_video_latents = []
+        if ref_video_paths:
+            import subprocess
+            for idx, rvp in enumerate(ref_video_paths):
+                # Decode video to raw rgb24 via ffmpeg.
+                proc = subprocess.run(
+                    ["ffprobe","-v","error","-select_streams","v:0",
+                     "-show_entries","stream=width,height,nb_frames,r_frame_rate",
+                     "-of","default=nw=1:nk=1", str(rvp)],
+                    capture_output=True, text=True, check=True)
+                pw, ph, nfr, rfr = proc.stdout.strip().split("\n")[:4]
+                pw, ph = int(pw), int(ph)
+                _log(f"ref_video[{idx}] probe ({rvp.name}): {pw}x{ph}, "
+                     f"nb_frames={nfr}, fps={rfr}")
+                rw = (pw // 16) * 16
+                rh = (ph // 16) * 16
+                raw = subprocess.run(
+                    ["ffmpeg","-loglevel","error","-i",str(rvp),
+                     "-vf",f"scale={rw}:{rh},fps=24","-vframes","17",
+                     "-pix_fmt","rgb24","-f","rawvideo","-"],
+                    capture_output=True, check=True).stdout
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, rh, rw, 3)
+                _log(f"ref_video[{idx}] decoded frames={arr.shape[0]} at {rh}x{rw}")
+                T = 17
+                if arr.shape[0] < T:
+                    arr = np.concatenate(
+                        [arr, np.repeat(arr[-1:], T - arr.shape[0], axis=0)], axis=0)
+                else:
+                    arr = arr[:T]
+                arr_f = arr.astype(np.float32) / 255.0
+                arr_f = arr_f * 2.0 - 1.0
+                arr_f = arr_f.transpose(3, 0, 1, 2)[None]
+                ref_v_x = mx.array(arr_f)
+                zv = pipe.video_vae.encode(ref_v_x)
+                ref_video_latents.append(zv)
+                _log(f"ref_video_latents[{idx}] shape: {zv.shape}")
+                if args.dump_ref_info:
+                    ref_info_entries.append({
+                        "ref_type": "video",
+                        "index_within_type": idx,
+                        "path": str(rvp),
+                        "input_shape": list(arr_f.shape),
+                        "latent_shape": list(zv.shape),
+                        "latent_stats": _lat_stats(zv),
+                        "text_marker": f"<Video {idx+1}>:",
+                    })
+        ref_video_latent = ref_video_latents[0] if ref_video_latents else None
+
+        ref_audio_latents = []
+        if ref_audio_paths:
+            from scipy.io import wavfile
+            for idx, rap in enumerate(ref_audio_paths):
+                sr, wav = wavfile.read(rap)
+                if wav.ndim == 1:
+                    wav = np.stack([wav, wav], axis=-1)
+                wav = wav.astype(np.float32) / 32768.0
+                wav_mx = mx.array(wav.T[None, ...])
+                za = pipe.audio_vae.encode(wav_mx)
+                ref_audio_latents.append(za)
+                _log(f"ref_audio_latents[{idx}] ({rap.name}) shape: {za.shape}")
+                if args.dump_ref_info:
+                    ref_info_entries.append({
+                        "ref_type": "audio",
+                        "index_within_type": idx,
+                        "path": str(rap),
+                        "input_shape": list(wav.T[None, ...].shape),
+                        "input_sample_rate": int(sr),
+                        "latent_shape": list(za.shape),
+                        "latent_stats": _lat_stats(za),
+                        "text_marker": f"<Audio {idx+1}>:",
+                    })
+        ref_audio_latent = ref_audio_latents[0] if ref_audio_latents else None
+
+        # Sub 5: paired ref-video-audio -> list[Optional[mx.array]] aligned with
+        # ref_video_paths. Same audio_vae; use 'none' entries to keep kind='video'
+        # for that slot.
+        ref_video_audio_latents: list = []
+        if ref_video_paths:
+            from scipy.io import wavfile
+            for idx, rvap in enumerate(ref_video_audio_paths):
+                if rvap is None:
+                    ref_video_audio_latents.append(None)
+                    continue
+                sr, wav = wavfile.read(rvap)
+                if wav.ndim == 1:
+                    wav = np.stack([wav, wav], axis=-1)
+                wav = wav.astype(np.float32) / 32768.0
+                wav_mx = mx.array(wav.T[None, ...])
+                zva = pipe.audio_vae.encode(wav_mx)
+                ref_video_audio_latents.append(zva)
+                _log(f"ref_video_audio_latents[{idx}] paired with "
+                     f"{ref_video_paths[idx].name} ({rvap.name}) shape: {zva.shape}")
+                if args.dump_ref_info:
+                    ref_info_entries.append({
+                        "ref_type": "video_audio",
+                        "index_within_type": idx,
+                        "paired_video_path": str(ref_video_paths[idx]),
+                        "path": str(rvap),
+                        "input_shape": list(wav.T[None, ...].shape),
+                        "input_sample_rate": int(sr),
+                        "latent_shape": list(zva.shape),
+                        "latent_stats": _lat_stats(zva),
+                        "text_marker": f"<Video {idx+1}Audio>:",
+                    })
+
+    # v18 260807 debug: try to compute per-ref packed_slot from a tentative
+    # PackedLayout so the JSON matches what the DiT will see.
+    if args.dump_ref_info and ref_info_entries:
+        try:
+            from mlx_video.models.minimax_h3.pipeline import (
+                PackedLayout, RefBlock, temporal_shape,
+            )
+            frame_count, latent_t_, audio_t_ = temporal_shape(args.length)
+            _refs = []
+            def _r(e):
+                if e["ref_type"] == "image":
+                    _, _, _, rh, rw = e["latent_shape"]
+                    return RefBlock(kind="image", latent_h=rh, latent_w=rw)
+                if e["ref_type"] == "video":
+                    _, _, vt, rh, rw = e["latent_shape"]
+                    return RefBlock(kind="video", latent_h=rh, latent_w=rw, latent_t=vt)
+                if e["ref_type"] == "video_audio":
+                    # NOTE: paired video is encoded separately; use its shape.
+                    return None
+                if e["ref_type"] == "audio":
+                    rat = e["latent_shape"][-1]
+                    return RefBlock(kind="audio", ref_audio_t=rat)
+                return None
+            _refs = [rb for rb in (_r(e) for e in ref_info_entries) if rb is not None]
+            _layout = PackedLayout(
+                256, latent_t_, args.height // 16, args.width // 16, audio_t_,
+                refs=_refs if _refs else None,
+            )
+            # Best-effort: attach packed_seq_len at top level (per-slot ranges
+            # are internal to PackedLayout; add if a public accessor exists).
+            for e in ref_info_entries:
+                e["packed_slot"] = {"note": "see PackedLayout; seq_len below",
+                                     "seq_len_total": int(_layout.seq_len)}
+        except Exception as _e:
+            for e in ref_info_entries:
+                e["packed_slot"] = {"error": repr(_e)}
+
+    if args.dump_ref_info:
+        import json as _json
+        _rp = Path(args.dump_ref_info).expanduser()
+        _rp.parent.mkdir(parents=True, exist_ok=True)
+        _rp.write_text(_json.dumps({
+            "refs": ref_info_entries,
+            "canvas": {"width": args.width, "height": args.height,
+                        "length": args.length},
+        }, indent=2, ensure_ascii=False))
+        _log(f"[v18] wrote ref-info json: {_rp}")
 
     # v16 260807 Sub4: turn on phase-evict AFTER refs are encoded so we don't
     # trip the "video_vae was evicted" check inside pipe.video_vae.encode above.
@@ -515,24 +696,26 @@ def main():
              "reloaded before decode; DiT dropped before decode)")
         pipe.enable_phase_evict(evict_video_vae_for_denoise=True, verbose=True)
 
-    # ---------- Stage 4: generate ----------
+    # ---------- Stage 4: generate (DiT sampling + VAE decode inside pipe) ----------
     _log(f"generating: {args.width}x{args.height}, {args.length} frames, "
          f"{args.num_steps} steps, seed={args.seed}")
     ctx_mx = mx.array(ctx_np).astype(mx.float32)
     t0 = time.time()
-    video_np, audio_np, info = pipe.generate(
-        prompt=args.prompt,  # ignored because context= is provided
-        width=args.width, height=args.height, length=args.length,
-        num_steps=args.num_steps, seed=args.seed,
-        ref_image_latents=ref_image_latents,
-        ref_video_latents=ref_video_latents,
-        ref_audio_latents=ref_audio_latents,
-        ref_video_audios=(ref_video_audio_latents
-                          if ref_video_paths and any(x is not None for x in ref_video_audio_latents)
-                          else None),
-        verbose=True,
-        context=ctx_mx,
-    )
+    with _StageTimer("dit-generate+vae-decode", args.verbose_memory):
+        video_np, audio_np, info = pipe.generate(
+            prompt=args.prompt,  # ignored because context= is provided
+            width=args.width, height=args.height, length=args.length,
+            num_steps=args.num_steps, seed=args.seed,
+            ref_image_latents=ref_image_latents,
+            ref_video_latents=ref_video_latents,
+            ref_audio_latents=ref_audio_latents,
+            ref_video_audios=(ref_video_audio_latents
+                              if ref_video_paths and any(x is not None for x in ref_video_audio_latents)
+                              else None),
+            verbose=True,
+            context=ctx_mx,
+            dump_latent_steps_path=args.dump_latent,
+        )
     _log(f"generate done in {time.time()-t0:.1f}s, info={info}")
     try:
         _log(f"mlx peak={mx.get_peak_memory()/1024**3:.2f} GiB, "
@@ -543,7 +726,8 @@ def main():
     # ---------- Stage 5: mux ----------
     out_path = Path(args.output).expanduser()
     _log(f"muxing to {out_path}...")
-    _run_ffmpeg(video_np, audio_np, fps=24, sample_rate=32000, out_path=out_path)
+    with _StageTimer("mux", args.verbose_memory):
+        _run_ffmpeg(video_np, audio_np, fps=24, sample_rate=32000, out_path=out_path)
     _log(f"wrote {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
     _log(f"mem(final): {_mem_snapshot()}")
 
